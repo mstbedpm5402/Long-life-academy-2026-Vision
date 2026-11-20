@@ -1,5 +1,5 @@
 /**
- * Long life learning Academy — Unified Single-File Production Server & SPA
+ * Long life learning Academy — Hardened Single-File Server & SPA
  * Tagline: "We innovate to teach you Skills , Knowledges and develop you Possotive Mindset"
  * Primary Admin: mohammedscho2023@gmail.com | Master Admin Code: 5405402
  *
@@ -42,13 +42,13 @@ const ACADEMY_TAGLINE =
 const PRIMARY_ADMIN_EMAIL = (process.env.PRIMARY_ADMIN_EMAIL || 'mohammedscho2023@gmail.com')
   .trim()
   .toLowerCase();
-const ADMIN_MASTER_CODE = process.env.ADMIN_MASTER_CODE || '5405402';
+const ADMIN_MASTER_CODE = String(process.env.ADMIN_MASTER_CODE || '5405402').trim();
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
   crypto.createHash('sha256').update(`${ADMIN_MASTER_CODE}:${PRIMARY_ADMIN_EMAIL}:llla-secret`).digest('hex');
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
-const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS) || 10;
+const SALT_ROUNDS = Math.min(Math.max(Number(process.env.BCRYPT_SALT_ROUNDS) || 10, 8), 14);
 
 const MIN_CERT_PASS_SCORE = Math.min(
   Math.max(Number(process.env.MIN_CERT_PASS_SCORE) || 75, 0),
@@ -66,10 +66,23 @@ const DATA_DIR = path.resolve(process.env.ACADEMY_DATA_DIR || path.join(process.
 const MEMORY_FILE_PATH = path.join(DATA_DIR, 'academy-memory.jsonl');
 const ACADEMY_CONFIG_FILE = path.join(DATA_DIR, 'academy-config.json');
 const MAX_MEMORY_INDEX_ENTRIES = Number(process.env.MAX_MEMORY_INDEX_ENTRIES) || 50_000;
+const MAX_MAP_ENTRIES = 10_000;
 
 const prisma = new PrismaClient({
   log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
 });
+
+function setBoundedMap(map, key, value, maxSize = MAX_MAP_ENTRIES) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+  map.set(key, value);
+}
+
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ============================================================================
 // 2. UNLIMITED PERSISTENT MEMORY & ACADEMY RUNTIME CONFIG
@@ -367,7 +380,7 @@ async function ensureAcademyConfig() {
 }
 
 // ============================================================================
-// 3. DOMAIN STORES (OTP, SOCIAL PROFILES, INSTRUCTORS, APPROVALS, LIBRARY, TOOLS, GRADING, CBL)
+// 3. DOMAIN STORES & HELPERS
 // ============================================================================
 const VALID_OTP_CHANNELS = new Set(['PHONE', 'WHATSAPP', 'TELEGRAM']);
 const otpChallengeStore = new Map();
@@ -522,9 +535,7 @@ function seedDefaultExternalTools() {
 seedDefaultExternalTools();
 
 function parseNonNegativeMoney(val, fieldName) {
-  if (val === undefined || val === null || val === '') {
-    return '0.00';
-  }
+  if (val === undefined || val === null || val === '') return '0.00';
   const num = Number(val);
   if (!Number.isFinite(num) || num < 0) {
     const err = new Error(`${fieldName} must be a non-negative number`);
@@ -535,18 +546,12 @@ function parseNonNegativeMoney(val, fieldName) {
 }
 
 function sanitizeFilenamePart(str) {
-  return String(str || 'Certificate')
-    .replace(/[^a-zA-Z0-9_-]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 60) || 'Certificate';
-}
-
-function saveSubmissionRecord(key, record) {
-  if (learnerSubmissions.size >= 10_000) {
-    const oldestKey = learnerSubmissions.keys().next().value;
-    learnerSubmissions.delete(oldestKey);
-  }
-  learnerSubmissions.set(key, record);
+  return (
+    String(str || 'Certificate')
+      .replace(/[^a-zA-Z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60) || 'Certificate'
+  );
 }
 
 function recordLearnerCourseScore(userId, courseId, score) {
@@ -569,7 +574,7 @@ function recordLearnerCourseScore(userId, courseId, score) {
     lastEvaluatedAt: new Date().toISOString(),
   };
 
-  learnerCourseScores.set(key, next);
+  setBoundedMap(learnerCourseScores, key, next);
   return next;
 }
 
@@ -625,11 +630,7 @@ async function processGatewayPayment({ amount, currency, paymentMethod, purpose,
     throw err;
   }
 
-  const prefixMap = {
-    TELEBIRR: 'TB',
-    CBE_BIRR: 'CBE',
-    PAYPAL: 'PP',
-  };
+  const prefixMap = { TELEBIRR: 'TB', CBE_BIRR: 'CBE', PAYPAL: 'PP' };
 
   return {
     status: 'COMPLETED',
@@ -700,7 +701,7 @@ function streamCourseCertificatePDF(res, { studentName, courseTitle, programming
 }
 
 // ============================================================================
-// 5. DOCKER SANDBOX RUNNER (PYTHON, JAVASCRIPT, GO, RUST) + CONCURRENCY QUEUE
+// 5. CODE EVALUATION & CONCURRENCY QUEUE
 // ============================================================================
 const SANDBOX_LANG_CONFIGS = {
   python: {
@@ -753,124 +754,12 @@ console.log('__TEST_REPORT__' + JSON.stringify(results));
 `,
     command: ['node', '--max-old-space-size=192', '/work/harness.js'],
   },
-  go: {
-    image: process.env.SANDBOX_GO_IMAGE || 'golang:1.23-alpine',
-    filename: 'solution.go',
-    harnessFilename: 'harness.go',
-    timeoutMs: 12000,
-    buildHarness: (casesJson) => `
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"strings"
-)
-
-type TestCase struct {
-	Name           string \`json:"name"\`
-	Input          any    \`json:"input"\`
-	ExpectedOutput string \`json:"expectedOutput"\`
-}
-
-type TestResult struct {
-	Name     string \`json:"name"\`
-	Passed   bool   \`json:"passed"\`
-	Actual   string \`json:"actual"\`
-	Expected string \`json:"expected"\`
-}
-
-func main() {
-	var cases []TestCase
-	_ = json.Unmarshal([]byte(${JSON.stringify(casesJson)}), &cases)
-	results := make([]TestResult, 0, len(cases))
-
-	for i, tc := range cases {
-		name := tc.Name
-		if name == "" {
-			name = fmt.Sprintf("Test #%d", i+1)
-		}
-		expected := strings.TrimSpace(tc.ExpectedOutput)
-		out := solve(tc.Input)
-		actual := strings.TrimSpace(fmt.Sprint(out))
-		passed := false
-		if expected != "" {
-			passed = actual == expected
-		} else {
-			passed = len(actual) > 0
-		}
-		results = append(results, TestResult{
-			Name:     name,
-			Passed:   passed,
-			Actual:   actual,
-			Expected: expected,
-		})
-	}
-
-	encoded, _ := json.Marshal(results)
-	fmt.Println("__TEST_REPORT__" + string(encoded))
-}
-`,
-    command: ['sh', '-c', 'GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomod go run /work/solution.go /work/harness.go'],
-  },
-  rust: {
-    image: process.env.SANDBOX_RUST_IMAGE || 'rust:1.83-slim',
-    filename: 'solution.rs',
-    harnessFilename: 'harness.rs',
-    timeoutMs: 15000,
-    buildHarness: (casesJson) => `
-use serde::Deserialize;
-use serde_json::json;
-
-#[derive(Deserialize)]
-struct TestCase {
-    name: Option<String>,
-    input: serde_json::Value,
-    #[serde(rename = "expectedOutput", default)]
-    expected_output: String,
-}
-
-include!("solution.rs");
-
-fn main() {
-    let raw = ${JSON.stringify(casesJson)};
-    let cases: Vec<TestCase> = serde_json::from_str(raw).unwrap_or_default();
-    let mut results = Vec::with_capacity(cases.len());
-
-    for (idx, tc) in cases.iter().enumerate() {
-        let name = tc.name.clone().unwrap_or_else(|| format!("Test #{}", idx + 1));
-        let expected = tc.expected_output.trim().to_string();
-        let actual = solve(tc.input.clone()).trim().to_string();
-        let passed = if !expected.is_empty() {
-            actual == expected
-        } else {
-            !actual.is_empty()
-        };
-        results.push(json!({
-            "name": name,
-            "passed": passed,
-            "actual": actual,
-            "expected": expected
-        }));
-    }
-
-    println!("__TEST_REPORT__{}", serde_json::to_string(&results).unwrap());
-}
-`,
-    command: [
-      'sh',
-      '-c',
-      'CARGO_TARGET_DIR=/tmp/cargo-target rustc /work/harness.rs -O -o /tmp/runner && /tmp/runner',
-    ],
-  },
 };
 
 function normalizeSandboxLanguage(lang) {
   const key = String(lang || '').trim().toLowerCase();
   if (key === 'py' || key.startsWith('python')) return 'python';
   if (key === 'js' || key === 'node' || key.startsWith('javascript')) return 'javascript';
-  if (key === 'go' || key.startsWith('golang')) return 'go';
-  if (key === 'rs' || key.startsWith('rust')) return 'rust';
   return null;
 }
 
@@ -888,19 +777,18 @@ async function runContainerTestCases({ language, code, testCases = [] }) {
 
   const runId = crypto.randomBytes(6).toString('hex');
   const tempDir = path.join(os.tmpdir(), `llla-sandbox-${runId}`);
-  await fs.mkdir(tempDir, { recursive: true });
+  await fsp.mkdir(tempDir, { recursive: true });
 
   try {
-    await fs.writeFile(path.join(tempDir, cfg.filename), String(code), 'utf8');
-    await fs.writeFile(
+    await fsp.writeFile(path.join(tempDir, cfg.filename), String(code), 'utf8');
+    await fsp.writeFile(
       path.join(tempDir, cfg.harnessFilename),
       cfg.buildHarness(JSON.stringify(cases)),
       'utf8'
     );
 
     const dockerArgs = [
-      'run',
-      '--rm',
+      'run', '--rm',
       '--network', 'none',
       '--memory', '256m',
       '--memory-swap', '256m',
@@ -954,7 +842,7 @@ async function runContainerTestCases({ language, code, testCases = [] }) {
         : `Sandbox execution failed: ${err.message}`,
     };
   } finally {
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -1123,10 +1011,7 @@ function evaluateSubmissionInProcess({ language, code, testCases = [] }) {
     passedCount,
     totalCount,
     results,
-    feedback:
-      status === 'PASSED'
-        ? `Passed ${passedCount}/${totalCount} test cases (${score}%).`
-        : `Passed ${passedCount}/${totalCount} test cases (${score}%).`,
+    feedback: `Passed ${passedCount}/${totalCount} test cases (${score}%).`,
   };
 }
 
@@ -1168,7 +1053,7 @@ async function evaluateCodeSubmissionQueued({ language, code, testCases = [] }) 
 }
 
 // ============================================================================
-// 6. FREE AI PROVIDERS, OPEN AI SYSTEM, LEARNING MONITOR, ADAPTIVE & CBL ENGINE
+// 6. OPEN AI STUDIO, MONITOR, ADAPTIVE LEARNING, CBL & WORKFLOWS
 // ============================================================================
 const OPEN_AI_MODES = {
   COPILOT: {
@@ -1219,12 +1104,7 @@ async function callFreeAiModel({ systemPrompt, userPrompt, preferredProvider = '
       const res = await fetch(ollamaUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: ollamaModel,
-          system: systemPrompt,
-          prompt: userPrompt,
-          stream: false,
-        }),
+        body: JSON.stringify({ model: ollamaModel, system: systemPrompt, prompt: userPrompt, stream: false }),
         signal: controller.signal,
       });
       if (res.ok) {
@@ -1435,7 +1315,7 @@ async function monitorLearnerProgress({
     updatedAt: new Date().toISOString(),
   };
 
-  learnerTelemetryStore.set(key, updated);
+  setBoundedMap(learnerTelemetryStore, key, updated);
 
   await writeUnlimitedMemory({
     scope: 'LEARNER',
@@ -1499,7 +1379,7 @@ async function adaptCourseForLearner({ userId, courseId, goal = '', pace = 'ADAP
     adaptedAt: new Date().toISOString(),
   };
 
-  learnerAdaptationsStore.set(`${userId}:${courseId}`, adaptivePlan);
+  setBoundedMap(learnerAdaptationsStore, `${userId}:${courseId}`, adaptivePlan);
 
   await writeUnlimitedMemory({
     scope: 'COURSE',
@@ -1553,8 +1433,8 @@ async function assessCompetence({
     updatedAt: new Date().toISOString(),
   };
 
-  currentMap.set(cId, record);
-  learnerCompetencesStore.set(storeKey, currentMap);
+  setBoundedMap(currentMap, cId, record);
+  setBoundedMap(learnerCompetencesStore, storeKey, currentMap);
 
   await writeUnlimitedMemory({
     scope: 'LEARNER',
@@ -1768,9 +1648,7 @@ async function runAutonomousCourseWorkflow({
       contentType: tpl.contentType,
       starterCode: tpl.starterCode,
       orderIndex: i + 1,
-      testCases: [
-        { name: `Test 1 (${tpl.suffix})`, input: tpl.input, expectedOutput: tpl.expectedOutput },
-      ],
+      testCases: [{ name: `Test 1 (${tpl.suffix})`, input: tpl.input, expectedOutput: tpl.expectedOutput }],
     });
   }
 
@@ -1784,9 +1662,7 @@ async function runAutonomousCourseWorkflow({
       certFeeETB: parseNonNegativeMoney(certFeeETB, 'certFeeETB'),
       certFeeUSD: parseNonNegativeMoney(certFeeUSD, 'certFeeUSD'),
       isPublished: Boolean(isPublished),
-      modules: {
-        create: plannedModules.map(({ testCases, ...row }) => row),
-      },
+      modules: { create: plannedModules.map(({ testCases, ...row }) => row) },
     },
     include: { modules: { orderBy: { orderIndex: 'asc' } } },
   });
@@ -1795,10 +1671,10 @@ async function runAutonomousCourseWorkflow({
   for (let i = 0; i < createdCourse.modules.length; i += 1) {
     const mod = createdCourse.modules[i];
     const cases = plannedModules[i]?.testCases || [];
-    moduleTestCases.set(`${createdCourse.id}:${mod.id}`, cases);
+    setBoundedMap(moduleTestCases, `${createdCourse.id}:${mod.id}`, cases);
     allCases.push(...cases);
   }
-  moduleTestCases.set(`${createdCourse.id}:general`, allCases);
+  setBoundedMap(moduleTestCases, `${createdCourse.id}:general`, allCases);
 
   const memoryRecord = await writeUnlimitedMemory({
     scope: 'COURSE',
@@ -1919,8 +1795,17 @@ async function seedBulkCourses({ totalCourses = 500, batchSize = 500, prefix = '
 }
 
 // ============================================================================
-// 7. MIDDLEWARE (RATE LIMITER, JWT AUTH & MASTER ADMIN CODE 5405402)
+// 7. MIDDLEWARE (PATH NORMALIZER, RATE LIMITER, JWT AUTH & ADMIN CODE 5405402)
 // ============================================================================
+function normalizeApiTrailingSlash(req, res, next) {
+  if (req.path.length > 1 && req.path.endsWith('/')) {
+    const queryIdx = req.originalUrl.indexOf('?');
+    const query = queryIdx >= 0 ? req.originalUrl.slice(queryIdx) : '';
+    req.url = req.path.slice(0, -1) + query;
+  }
+  next();
+}
+
 function createRateLimiter({ windowMs = 60_000, max = 40 } = {}) {
   const hits = new Map();
   return (req, res, next) => {
@@ -1929,7 +1814,7 @@ function createRateLimiter({ windowMs = 60_000, max = 40 } = {}) {
     const entry = hits.get(key);
 
     if (!entry || now > entry.resetAt) {
-      hits.set(key, { count: 1, resetAt: now + windowMs });
+      setBoundedMap(hits, key, { count: 1, resetAt: now + windowMs });
       return next();
     }
     if (entry.count >= max) {
@@ -1944,31 +1829,33 @@ function signToken(user) {
   return jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
-async function protect(req, res, next) {
+const protect = asyncHandler(async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication token required' });
+  }
+  const token = authHeader.slice(7).trim();
+  let decoded;
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Authentication token required' });
-    }
-    const token = authHeader.slice(7).trim();
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await prisma.user.findUnique({
-      where: { id: decoded.userId },
-      select: { id: true, name: true, email: true, role: true },
-    });
-    if (!user) {
-      return res.status(401).json({ error: 'User no longer exists' });
-    }
-    req.user = user;
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (_) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
-}
+
+  const user = await prisma.user.findUnique({
+    where: { id: decoded.userId },
+    select: { id: true, name: true, email: true, role: true },
+  });
+  if (!user) {
+    return res.status(401).json({ error: 'User no longer exists' });
+  }
+  req.user = user;
+  next();
+});
 
 function requireAdminCode(req, res, next) {
   const providedCode = req.headers['x-admin-code'];
-  if (!providedCode || String(providedCode).trim() !== String(ADMIN_MASTER_CODE)) {
+  if (!providedCode || String(providedCode).trim() !== ADMIN_MASTER_CODE) {
     return res.status(403).json({
       error: `Forbidden: Valid master Admin Code (${ADMIN_MASTER_CODE}) is required in x-admin-code header`,
     });
@@ -2013,38 +1900,43 @@ function verifyContactVerificationToken(token, expectedChannel, expectedTarget) 
 }
 
 // ============================================================================
-// 8. EXPRESS APP & ALL API ROUTES
+// 8. EXPRESS APP & ALL ROUTES
 // ============================================================================
 const app = express();
 
 app.disable('x-powered-by');
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
+app.use(normalizeApiTrailingSlash);
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const authLimiter = createRateLimiter({ windowMs: 60_000, max: 30 });
 const paymentLimiter = createRateLimiter({ windowMs: 60_000, max: 35 });
 
-app.get('/api/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    const cfg = await ensureAcademyConfig();
-    res.status(200).json({
-      status: 'ok',
-      database: 'connected',
-      academy: cfg.academyName,
-      tagline: cfg.tagline,
-      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
-      sandboxQueue: sandboxQueue.stats(),
-    });
-  } catch (_) {
-    res.status(503).json({ status: 'degraded', database: 'disconnected' });
-  }
-});
+app.get(
+  '/api/health',
+  asyncHandler(async (req, res) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      const cfg = await ensureAcademyConfig();
+      return res.status(200).json({
+        status: 'ok',
+        database: 'connected',
+        academy: cfg.academyName,
+        tagline: cfg.tagline,
+        primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+        sandboxQueue: sandboxQueue.stats(),
+      });
+    } catch (_) {
+      return res.status(503).json({ status: 'degraded', database: 'disconnected' });
+    }
+  })
+);
 
-app.get('/api/academy/profile', async (req, res, next) => {
-  try {
+app.get(
+  '/api/academy/profile',
+  asyncHandler(async (req, res) => {
     const cfg = await ensureAcademyConfig();
     const memStats = await getMemoryStats();
     return res.status(200).json({
@@ -2052,15 +1944,14 @@ app.get('/api/academy/profile', async (req, res, next) => {
       openAiModes: Object.values(OPEN_AI_MODES),
       memory: memStats,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-// --- Auth & Multi-Channel Registration (Email, Phone, WhatsApp, Telegram + OTP + Social Links) ---
+// --- Auth & Multi-Channel Registration ---
 app.post('/api/auth/request-otp', authLimiter, (req, res) => {
-  const channel = String(req.body.channel || '').trim().toUpperCase();
-  const target = normalizeOtpTarget(channel, req.body.target);
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const channel = String(body.channel || '').trim().toUpperCase();
+  const target = normalizeOtpTarget(channel, body.target);
 
   if (!VALID_OTP_CHANNELS.has(channel)) {
     return res.status(400).json({ error: 'channel must be PHONE, WHATSAPP, or TELEGRAM.' });
@@ -2070,7 +1961,7 @@ app.post('/api/auth/request-otp', authLimiter, (req, res) => {
   }
 
   const code = String(crypto.randomInt(100000, 1000000));
-  otpChallengeStore.set(`${channel}:${target}`, {
+  setBoundedMap(otpChallengeStore, `${channel}:${target}`, {
     codeHash: hashOtpCode(channel, target, code),
     expiresAt: Date.now() + OTP_TTL_MS,
     attempts: 0,
@@ -2087,9 +1978,10 @@ app.post('/api/auth/request-otp', authLimiter, (req, res) => {
 });
 
 app.post('/api/auth/verify-otp', authLimiter, (req, res) => {
-  const channel = String(req.body.channel || '').trim().toUpperCase();
-  const target = normalizeOtpTarget(channel, req.body.target);
-  const code = String(req.body.code || '').trim();
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const channel = String(body.channel || '').trim().toUpperCase();
+  const target = normalizeOtpTarget(channel, body.target);
+  const code = String(body.code || '').trim();
 
   if (!VALID_OTP_CHANNELS.has(channel) || !target || !code) {
     return res.status(400).json({ error: 'channel, target, and code are required.' });
@@ -2127,9 +2019,12 @@ app.post('/api/auth/verify-otp', authLimiter, (req, res) => {
   return res.status(200).json({ verified: true, channel, target, verificationToken });
 });
 
-app.post('/api/auth/register', authLimiter, async (req, res, next) => {
-  try {
-    const { name, email, password, role } = req.body;
+app.post(
+  '/api/auth/register',
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { name, email, password, role } = body;
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
@@ -2148,26 +2043,21 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
       normalizedEmail === PRIMARY_ADMIN_EMAIL || role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
 
     const user = await prisma.user.create({
-      data: {
-        name: String(name).trim(),
-        email: normalizedEmail,
-        passwordHash,
-        role: assignedRole,
-      },
+      data: { name: String(name).trim(), email: normalizedEmail, passwordHash, role: assignedRole },
       select: { id: true, name: true, email: true, role: true, createdAt: true },
     });
 
     const token = signToken(user);
     return res.status(201).json({ user, token });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/auth/register-multi', authLimiter, async (req, res, next) => {
-  try {
-    const { name, email, phone, whatsapp, telegram, password, socialLinks, verificationToken } =
-      req.body;
+app.post(
+  '/api/auth/register-multi',
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { name, email, phone, whatsapp, telegram, password, socialLinks, verificationToken } = body;
 
     const cleanPhone = String(phone || '').trim();
     const cleanWhatsapp = String(whatsapp || '').trim();
@@ -2246,18 +2136,19 @@ app.post('/api/auth/register-multi', authLimiter, async (req, res, next) => {
       telegram: cleanTelegram || null,
       socialLinks: linkedSocials,
     };
-    learnerSocialProfiles.set(user.id, profile);
+    setBoundedMap(learnerSocialProfiles, user.id, profile);
 
     const token = signToken(user);
     return res.status(201).json({ user, profile, token });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/auth/login', authLimiter, async (req, res, next) => {
-  try {
-    const { email, password } = req.body;
+app.post(
+  '/api/auth/login',
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { email, password } = body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
@@ -2282,12 +2173,11 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
     const token = signToken(safeUser);
     const profile = learnerSocialProfiles.get(user.id) || null;
     return res.status(200).json({ user: safeUser, profile, token });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 app.put('/api/profile/socials', protect, (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
   const existing = learnerSocialProfiles.get(req.user.id) || {
     userId: req.user.id,
     email: req.user.email,
@@ -2299,24 +2189,25 @@ app.put('/api/profile/socials', protect, (req, res) => {
 
   const updated = {
     ...existing,
-    phone: req.body.phone !== undefined ? String(req.body.phone).trim() || null : existing.phone,
+    phone: body.phone !== undefined ? String(body.phone).trim() || null : existing.phone,
     whatsapp:
-      req.body.whatsapp !== undefined ? String(req.body.whatsapp).trim() || null : existing.whatsapp,
+      body.whatsapp !== undefined ? String(body.whatsapp).trim() || null : existing.whatsapp,
     telegram:
-      req.body.telegram !== undefined ? String(req.body.telegram).trim() || null : existing.telegram,
+      body.telegram !== undefined ? String(body.telegram).trim() || null : existing.telegram,
     socialLinks: {
       ...existing.socialLinks,
-      ...normalizeSocialLinks(req.body.socialLinks),
+      ...normalizeSocialLinks(body.socialLinks),
     },
   };
 
-  learnerSocialProfiles.set(req.user.id, updated);
+  setBoundedMap(learnerSocialProfiles, req.user.id, updated);
   return res.status(200).json({ profile: updated });
 });
 
 // --- Public Catalog (Cursor-Paginated for 1M+ Courses) ---
-app.get('/api/courses', async (req, res, next) => {
-  try {
+app.get(
+  '/api/courses',
+  asyncHandler(async (req, res) => {
     const rawLimit = Number(req.query.limit) || 24;
     const limit = Math.min(Math.max(rawLimit, 1), 100);
     const cursor = req.query.cursor ? String(req.query.cursor).trim() : null;
@@ -2365,14 +2256,15 @@ app.get('/api/courses', async (req, res, next) => {
       courses: items,
       pageInfo: { limit, hasMore, nextCursor },
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 // --- Student Course Upload (Pending Admin Approval) ---
-app.post('/api/student-courses/upload', protect, async (req, res, next) => {
-  try {
+app.post(
+  '/api/student-courses/upload',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const {
       title,
       description,
@@ -2383,7 +2275,7 @@ app.post('/api/student-courses/upload', protect, async (req, res, next) => {
       certFeeUSD,
       starterCode,
       contentUrl,
-    } = req.body;
+    } = body;
 
     if (!title || !description) {
       return res.status(400).json({ error: 'Course title and description are required.' });
@@ -2427,23 +2319,25 @@ app.post('/api/student-courses/upload', protect, async (req, res, next) => {
       reviewedAt: null,
       reviewNotes: '',
     };
-    courseReviewMeta.set(draftCourse.id, approval);
+    setBoundedMap(courseReviewMeta, draftCourse.id, approval);
 
     return res.status(201).json({
       message: 'Course uploaded and submitted for Admin approval.',
       course: draftCourse,
       approval,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-// --- Enrollment, Code Submissions (Queued + Test Cases) & Score-Gated Certificates ---
-app.post('/api/enroll', protect, paymentLimiter, async (req, res, next) => {
-  try {
+// --- Enrollment, Submissions & Score-Gated Certificates ---
+app.post(
+  '/api/enroll',
+  protect,
+  paymentLimiter,
+  asyncHandler(async (req, res) => {
     const userId = req.user.id;
-    const { courseId, currency, paymentMethod } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { courseId, currency, paymentMethod } = body;
     if (!courseId || !currency || !paymentMethod) {
       return res.status(400).json({ error: 'courseId, currency, and paymentMethod are required' });
     }
@@ -2504,27 +2398,28 @@ app.post('/api/enroll', protect, paymentLimiter, async (req, res, next) => {
     });
 
     return res.status(201).json(result);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.get('/api/my-courses', protect, async (req, res, next) => {
-  try {
+app.get(
+  '/api/my-courses',
+  protect,
+  asyncHandler(async (req, res) => {
     const enrollments = await prisma.enrollment.findMany({
       where: { userId: req.user.id, paymentStatus: 'COMPLETED' },
       include: { course: { include: { modules: { orderBy: { orderIndex: 'asc' } } } } },
       orderBy: { enrolledAt: 'desc' },
     });
     return res.status(200).json({ enrollments });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/submissions', protect, async (req, res, next) => {
-  try {
-    const { courseId, moduleId, language, code, notes } = req.body;
+app.post(
+  '/api/submissions',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { courseId, moduleId, language, code, notes } = body;
     if (!courseId || !code) {
       return res.status(400).json({ error: 'courseId and code are required' });
     }
@@ -2564,23 +2459,25 @@ app.post('/api/submissions', protect, async (req, res, next) => {
       submittedAt: new Date().toISOString(),
     };
 
-    saveSubmissionRecord(subKey, record);
+    setBoundedMap(learnerSubmissions, subKey, record);
     return res.status(201).json({ submission: record, evaluation, scoreSummary });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 app.get('/api/submissions', protect, (req, res) => {
   const mine = Array.from(learnerSubmissions.values()).filter((s) => s.userId === req.user.id);
   return res.status(200).json({ submissions: mine });
 });
 
-app.post('/api/certificate/:courseId', protect, paymentLimiter, async (req, res, next) => {
-  try {
+app.post(
+  '/api/certificate/:courseId',
+  protect,
+  paymentLimiter,
+  asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const { courseId } = req.params;
-    const { currency, paymentMethod } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { currency, paymentMethod } = body;
 
     const enrollment = await prisma.enrollment.findUnique({
       where: { userId_courseId: { userId, courseId } },
@@ -2654,13 +2551,13 @@ app.post('/api/certificate/:courseId', protect, paymentLimiter, async (req, res,
       issuedDate: updatedEnrollment.certifiedAt || new Date(),
       certificateId: updatedEnrollment.id,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.get('/api/certificate/:courseId/download', protect, async (req, res, next) => {
-  try {
+app.get(
+  '/api/certificate/:courseId/download',
+  protect,
+  asyncHandler(async (req, res) => {
     const userId = req.user.id;
     const { courseId } = req.params;
     const enrollment = await prisma.enrollment.findUnique({
@@ -2687,12 +2584,10 @@ app.get('/api/certificate/:courseId/download', protect, async (req, res, next) =
       issuedDate: enrollment.certifiedAt || new Date(),
       certificateId: enrollment.id,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-// --- Library of Resources & Admin External Tools ---
+// --- Library, External Tools & Instructors ---
 app.get('/api/resources', (req, res) => {
   const typeFilter = String(req.query.type || '').trim().toUpperCase();
   const q = String(req.query.q || '').trim().toLowerCase();
@@ -2731,10 +2626,13 @@ app.get('/api/instructors', (req, res) => {
   return res.status(200).json({ instructors: Array.from(instructorsDirectory.values()) });
 });
 
-// --- Unlimited Persistent Memory, Free AI Agents, Open AI Studio, Monitor, Adaptive & CBL ---
-app.post('/api/memory', protect, async (req, res, next) => {
-  try {
-    const { scope, entityId, title, content, tags } = req.body;
+// --- Memory, Open AI, Monitor, Adaptive, CBL & Workflows ---
+app.post(
+  '/api/memory',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { scope, entityId, title, content, tags } = body;
     if (!content || !String(content).trim()) {
       return res.status(400).json({ error: 'Memory content is required.' });
     }
@@ -2750,13 +2648,12 @@ app.post('/api/memory', protect, async (req, res, next) => {
     });
 
     return res.status(201).json({ memory });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.get('/api/memory', async (req, res, next) => {
-  try {
+app.get(
+  '/api/memory',
+  asyncHandler(async (req, res) => {
     const result = await queryUnlimitedMemory({
       q: req.query.q || '',
       scope: req.query.scope || '',
@@ -2766,13 +2663,12 @@ app.get('/api/memory', async (req, res, next) => {
     });
     const stats = await getMemoryStats();
     return res.status(200).json({ ...result, stats });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.get('/api/memory/export', async (req, res, next) => {
-  try {
+app.get(
+  '/api/memory/export',
+  asyncHandler(async (req, res) => {
     const backup = await exportUnlimitedMemoryJsonl();
     if (String(req.query.format || '').toLowerCase() === 'json') {
       return res.status(200).json(backup);
@@ -2781,43 +2677,42 @@ app.get('/api/memory/export', async (req, res, next) => {
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="academy-memory-${stamp}.jsonl"`);
     return res.status(200).send(backup.jsonl);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/memory/import', requireAdminCode, async (req, res, next) => {
-  try {
-    const { jsonlText, records, regenerateIds } = req.body;
+app.post(
+  '/api/memory/import',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const result = await importUnlimitedMemoryJsonl({
-      jsonlText,
-      records,
-      regenerateIds: Boolean(regenerateIds),
+      jsonlText: body.jsonlText,
+      records: body.records,
+      regenerateIds: Boolean(body.regenerateIds),
     });
     return res.status(200).json({
       message: `Imported ${result.importedCount} memory record(s) (${result.skippedDuplicateCount} duplicate(s) skipped).`,
       ...result,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/ai/agent/chat', async (req, res, next) => {
-  try {
-    const { mode, agentId, message, preferredProvider, courseId } = req.body;
+app.post(
+  '/api/ai/agent/chat',
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     let course = null;
-    if (courseId) {
+    if (body.courseId) {
       course = await prisma.course.findUnique({
-        where: { id: String(courseId) },
+        where: { id: String(body.courseId) },
         include: { modules: { orderBy: { orderIndex: 'asc' } } },
       });
     }
     const result = await runAcademyOpenAi({
-      mode: mode || agentId || 'CHATGPT_COACH',
-      prompt: message,
+      mode: body.mode || body.agentId || 'CHATGPT_COACH',
+      prompt: body.message,
       course,
-      preferredProvider,
+      preferredProvider: body.preferredProvider,
     });
     return res.status(200).json({
       agent: result.mode,
@@ -2825,106 +2720,107 @@ app.post('/api/ai/agent/chat', async (req, res, next) => {
       reply: result.output,
       memorySaved: result.memorySaved,
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/ai/agent/run', requireAdminCode, async (req, res, next) => {
-  try {
-    const { agentId, targetScope, courseId, prompt, autoApply, preferredProvider } = req.body;
+app.post(
+  '/api/ai/agent/run',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const outcome = await runPromptImprovementAgent({
-      agentId,
-      targetScope: String(targetScope || 'COURSE').toUpperCase(),
-      courseId,
-      prompt,
-      autoApply: autoApply !== undefined ? Boolean(autoApply) : true,
-      preferredProvider,
+      agentId: body.agentId,
+      targetScope: String(body.targetScope || 'COURSE').toUpperCase(),
+      courseId: body.courseId,
+      prompt: body.prompt,
+      autoApply: body.autoApply !== undefined ? Boolean(body.autoApply) : true,
+      preferredProvider: body.preferredProvider,
     });
     return res.status(200).json(outcome);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/ai/workflow/create-course', requireAdminCode, async (req, res, next) => {
-  try {
-    const outcome = await runAutonomousCourseWorkflow(req.body || {});
+app.post(
+  '/api/ai/workflow/create-course',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const outcome = await runAutonomousCourseWorkflow(body);
     return res.status(201).json(outcome);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/open-ai/studio', async (req, res, next) => {
-  try {
-    const { mode, prompt, codeContext, courseId, preferredProvider } = req.body;
+app.post(
+  '/api/open-ai/studio',
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     let course = null;
-    if (courseId) {
+    if (body.courseId) {
       course = await prisma.course.findUnique({
-        where: { id: String(courseId) },
+        where: { id: String(body.courseId) },
         include: { modules: { orderBy: { orderIndex: 'asc' } } },
       });
     }
     const result = await runAcademyOpenAi({
-      mode,
-      prompt,
-      codeContext,
+      mode: body.mode,
+      prompt: body.prompt,
+      codeContext: body.codeContext,
       course,
-      preferredProvider,
+      preferredProvider: body.preferredProvider,
     });
     return res.status(200).json({ ...result, availableModes: Object.values(OPEN_AI_MODES) });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/open-ai/monitor/track', protect, async (req, res, next) => {
-  try {
+app.post(
+  '/api/open-ai/monitor/track',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const telemetry = await monitorLearnerProgress({
       userId: req.user.id,
-      courseId: req.body.courseId || 'general',
-      moduleId: req.body.moduleId || 'general',
-      score: req.body.score,
-      timeSpentMinutes: req.body.timeSpentMinutes,
-      completedLesson: Boolean(req.body.completedLesson),
-      mindsetNote: req.body.mindsetNote,
+      courseId: body.courseId || 'general',
+      moduleId: body.moduleId || 'general',
+      score: body.score,
+      timeSpentMinutes: body.timeSpentMinutes,
+      completedLesson: Boolean(body.completedLesson),
+      mindsetNote: body.mindsetNote,
     });
     return res.status(200).json({ telemetry });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/open-ai/adapt-course', protect, async (req, res, next) => {
-  try {
+app.post(
+  '/api/open-ai/adapt-course',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const adaptation = await adaptCourseForLearner({
       userId: req.user.id,
-      courseId: req.body.courseId,
-      goal: req.body.goal,
-      pace: req.body.pace,
+      courseId: body.courseId,
+      goal: body.goal,
+      pace: body.pace,
     });
     return res.status(200).json({ adaptation });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/open-ai/competence/assess', protect, async (req, res, next) => {
-  try {
+app.post(
+  '/api/open-ai/competence/assess',
+  protect,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const outcome = await assessCompetence({
       userId: req.user.id,
-      courseId: req.body.courseId || 'general',
-      competencyId: req.body.competencyId,
-      competencyName: req.body.competencyName,
-      evidenceScore: req.body.evidenceScore,
-      evidenceNotes: req.body.evidenceNotes,
+      courseId: body.courseId || 'general',
+      competencyId: body.competencyId,
+      competencyName: body.competencyName,
+      evidenceScore: body.evidenceScore,
+      evidenceNotes: body.evidenceNotes,
     });
     return res.status(200).json(outcome);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 app.get('/api/open-ai/competence', protect, (req, res) => {
   const courseId = String(req.query.courseId || 'general');
@@ -2932,8 +2828,11 @@ app.get('/api/open-ai/competence', protect, (req, res) => {
 });
 
 // --- Protected Admin Routes (x-admin-code: 5405402) ---
-app.post('/api/admin/courses', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const {
       title,
       description,
@@ -2944,7 +2843,7 @@ app.post('/api/admin/courses', requireAdminCode, async (req, res, next) => {
       certFeeETB,
       certFeeUSD,
       isPublished,
-    } = req.body;
+    } = body;
 
     if (!title || !description) {
       return res.status(400).json({ error: 'title and description are required' });
@@ -2965,23 +2864,23 @@ app.post('/api/admin/courses', requireAdminCode, async (req, res, next) => {
     });
 
     return res.status(201).json({ course });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/seed-bulk', requireAdminCode, async (req, res, next) => {
-  try {
-    const { totalCourses, batchSize, prefix } = req.body || {};
-    const stats = await seedBulkCourses({ totalCourses, batchSize, prefix });
+app.post(
+  '/api/admin/courses/seed-bulk',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const stats = await seedBulkCourses(body);
     return res.status(201).json({ message: 'Bulk courses seeded.', ...stats });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.get('/api/admin/courses/review-queue', requireAdminCode, async (req, res, next) => {
-  try {
+app.get(
+  '/api/admin/courses/review-queue',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const courses = await prisma.course.findMany({
       include: { modules: { orderBy: { orderIndex: 'asc' } } },
       orderBy: { createdAt: 'desc' },
@@ -2997,16 +2896,17 @@ app.get('/api/admin/courses/review-queue', requireAdminCode, async (req, res, ne
     }));
 
     return res.status(200).json({ courses: enriched });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/:id/approve', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses/:id/approve',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const action = String(req.body.action || 'APPROVE').trim().toUpperCase();
-    const notes = req.body.notes ? String(req.body.notes).trim() : '';
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const action = String(body.action || 'APPROVE').trim().toUpperCase();
+    const notes = body.notes ? String(body.notes).trim() : '';
 
     const course = await prisma.course.findUnique({ where: { id } });
     if (!course) {
@@ -3026,18 +2926,19 @@ app.post('/api/admin/courses/:id/approve', requireAdminCode, async (req, res, ne
       reviewedAt: new Date().toISOString(),
       reviewNotes: notes,
     };
-    courseReviewMeta.set(id, approval);
+    setBoundedMap(courseReviewMeta, id, approval);
 
     return res.status(200).json({ course: updatedCourse, approval });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/:id/pass-score', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses/:id/pass-score',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const minScore = Number(req.body.minScore);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const minScore = Number(body.minScore);
     if (!Number.isFinite(minScore) || minScore < 0 || minScore > 100) {
       return res.status(400).json({ error: 'minScore must be between 0 and 100.' });
     }
@@ -3045,17 +2946,18 @@ app.post('/api/admin/courses/:id/pass-score', requireAdminCode, async (req, res,
     if (!course) {
       return res.status(404).json({ error: 'Course not found.' });
     }
-    coursePassScoreOverrides.set(id, minScore);
+    setBoundedMap(coursePassScoreOverrides, id, minScore);
     return res.status(200).json({ courseId: id, minPassScore: minScore });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/:id/modules', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses/:id/modules',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const { id: courseId } = req.params;
-    const { title, contentUrl, language, contentType, starterCode, orderIndex } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { title, contentUrl, language, contentType, starterCode, orderIndex } = body;
     if (!title || !contentUrl) {
       return res.status(400).json({ error: 'title and contentUrl are required' });
     }
@@ -3078,15 +2980,16 @@ app.post('/api/admin/courses/:id/modules', requireAdminCode, async (req, res, ne
     });
 
     return res.status(201).json({ module: createdModule });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/:id/test-cases', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses/:id/test-cases',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const { id: courseId } = req.params;
-    const { moduleId, testCases } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { moduleId, testCases } = body;
     if (!Array.isArray(testCases) || testCases.length === 0) {
       return res.status(400).json({ error: 'testCases must be a non-empty array' });
     }
@@ -3096,15 +2999,16 @@ app.post('/api/admin/courses/:id/test-cases', requireAdminCode, async (req, res,
       return res.status(404).json({ error: 'Course not found' });
     }
 
-    moduleTestCases.set(`${courseId}:${moduleId || 'general'}`, testCases);
+    setBoundedMap(moduleTestCases, `${courseId}:${moduleId || 'general'}`, testCases);
     return res.status(201).json({ courseId, moduleId: moduleId || 'general', count: testCases.length });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-app.post('/api/admin/courses/convert-source', requireAdminCode, async (req, res, next) => {
-  try {
+app.post(
+  '/api/admin/courses/convert-source',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const {
       courseTitle,
       description,
@@ -3119,7 +3023,7 @@ app.post('/api/admin/courses/convert-source', requireAdminCode, async (req, res,
       certFeeUSD,
       toolIds,
       isPublished,
-    } = req.body;
+    } = body;
 
     const resolvedTitle = String(courseTitle || '').trim();
     if (!resolvedTitle) {
@@ -3159,11 +3063,11 @@ app.post('/api/admin/courses/convert-source', requireAdminCode, async (req, res,
       if (tool.requiredForCourses) linkedSet.add(tId);
     }
     if (linkedSet.size > 0) {
-      courseLinkedTools.set(createdCourse.id, linkedSet);
+      setBoundedMap(courseLinkedTools, createdCourse.id, linkedSet);
     }
 
     const resId = `res_${crypto.randomBytes(4).toString('hex')}`;
-    resourceLibrary.set(resId, {
+    setBoundedMap(resourceLibrary, resId, {
       id: resId,
       title: resolvedTitle,
       resourceType: normType,
@@ -3180,13 +3084,12 @@ app.post('/api/admin/courses/convert-source', requireAdminCode, async (req, res,
       course: createdCourse,
       linkedToolIds: Array.from(linkedSet),
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 app.post('/api/admin/resources', requireAdminCode, (req, res) => {
-  const { title, resourceType, language, url, summary, tags } = req.body;
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { title, resourceType, language, url, summary, tags } = body;
   if (!title) {
     return res.status(400).json({ error: 'Resource title is required.' });
   }
@@ -3212,12 +3115,13 @@ app.post('/api/admin/resources', requireAdminCode, (req, res) => {
     addedAt: new Date().toISOString(),
   };
 
-  resourceLibrary.set(id, resource);
+  setBoundedMap(resourceLibrary, id, resource);
   return res.status(201).json({ resource });
 });
 
 app.post('/api/admin/external-tools', requireAdminCode, (req, res) => {
-  const { name, category, url, description, requiredForCourses, courseId } = req.body;
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { name, category, url, description, requiredForCourses, courseId } = body;
   if (!name || !url) {
     return res.status(400).json({ error: 'Tool name and url are required.' });
   }
@@ -3237,11 +3141,12 @@ app.post('/api/admin/external-tools', requireAdminCode, (req, res) => {
     addedAt: new Date().toISOString(),
   };
 
-  externalToolsDirectory.set(id, tool);
+  setBoundedMap(externalToolsDirectory, id, tool);
   if (courseId) {
-    const set = courseLinkedTools.get(String(courseId).trim()) || new Set();
+    const cKey = String(courseId).trim();
+    const set = courseLinkedTools.get(cKey) || new Set();
     set.add(id);
-    courseLinkedTools.set(String(courseId).trim(), set);
+    setBoundedMap(courseLinkedTools, cKey, set);
   }
 
   return res.status(201).json({ tool });
@@ -3260,7 +3165,8 @@ app.delete('/api/admin/external-tools/:id', requireAdminCode, (req, res) => {
 });
 
 app.post('/api/admin/instructors', requireAdminCode, (req, res) => {
-  const { name, email, phone, whatsapp, telegram, specialties, socialLinks } = req.body;
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { name, email, phone, whatsapp, telegram, specialties, socialLinks } = body;
   if (!name) {
     return res.status(400).json({ error: 'Instructor name is required.' });
   }
@@ -3284,7 +3190,7 @@ app.post('/api/admin/instructors', requireAdminCode, (req, res) => {
     addedAt: new Date().toISOString(),
   };
 
-  instructorsDirectory.set(id, instructor);
+  setBoundedMap(instructorsDirectory, id, instructor);
   return res.status(201).json({ instructor });
 });
 
@@ -3292,8 +3198,10 @@ app.get('/api/admin/submissions', requireAdminCode, (req, res) => {
   return res.status(200).json({ submissions: Array.from(learnerSubmissions.values()).slice(-200) });
 });
 
-app.get('/api/admin/analytics', requireAdminCode, async (req, res, next) => {
-  try {
+app.get(
+  '/api/admin/analytics',
+  requireAdminCode,
+  asyncHandler(async (req, res) => {
     const [totalStudents, totalCourses, totalEnrollments, completedTransactions] =
       await Promise.all([
         prisma.user.count({ where: { role: 'STUDENT' } }),
@@ -3321,1270 +3229,83 @@ app.get('/api/admin/analytics', requireAdminCode, async (req, res, next) => {
         USD: Number(revenueUSD.toFixed(2)),
       },
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
 // ============================================================================
-// 9. UNIFIED EMBEDDED FRONTEND SPA ("Long life learning Academy")
+// 9. FRONTEND SPA & DIAGNOSTIC 404 / ERROR HANDLERS
 // ============================================================================
-const FRONTEND_HTML = `<!DOCTYPE html>
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Long life learning Academy</title>
+  <title>${ACADEMY_NAME}</title>
   <style>
-    :root { --primary:#004aad; --primary-dark:#003175; --accent:#fca311; --dark:#0f172a; --bg:#f4f7fb; --card:#ffffff; --text:#1e293b; --muted:#64748b; --success:#15803d; --danger:#b91c1c; --border:#e2e8f0; }
+    :root { --primary:#004aad; --accent:#fca311; --dark:#0f172a; --bg:#f4f7fb; --card:#ffffff; --text:#1e293b; --muted:#64748b; --success:#15803d; --danger:#b91c1c; --border:#e2e8f0; }
     * { box-sizing:border-box; margin:0; padding:0; font-family:"Segoe UI",system-ui,-apple-system,sans-serif; }
     body { background:var(--bg); color:var(--text); line-height:1.55; }
     nav { background:var(--dark); color:#fff; padding:0.9rem 1.5rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.65rem; }
-    nav .brand-wrap { cursor:pointer; }
-    nav .brand { font-size:1.12rem; font-weight:800; color:#fff; }
-    nav .tagline { font-size:0.76rem; color:#fcd34d; font-style:italic; }
-    nav .nav-actions { display:flex; gap:0.45rem; flex-wrap:wrap; align-items:center; }
-    button, select, input, textarea { font-family:inherit; font-size:0.9rem; }
-    button { border:none; border-radius:6px; padding:0.48rem 0.88rem; font-weight:600; cursor:pointer; }
-    button:hover { opacity:0.92; }
-    button:disabled { opacity:0.55; cursor:not-allowed; }
-    .btn-primary { background:var(--primary); color:#fff; }
-    .btn-accent { background:var(--accent); color:var(--dark); }
-    .btn-success { background:var(--success); color:#fff; }
-    .btn-danger { background:var(--danger); color:#fff; }
-    .btn-ghost { background:rgba(255,255,255,0.12); color:#fff; }
-    .container { max-width:1240px; margin:1.5rem auto; padding:0 1rem; }
-    .hidden { display:none !important; }
-    .hero { background:linear-gradient(135deg,#0f172a 0%,#004aad 100%); color:#fff; border-radius:12px; padding:1.4rem; margin-bottom:1.15rem; }
-    .hero p { color:#e2e8f0; font-style:italic; margin-top:0.3rem; font-size:0.96rem; }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; box-shadow:0 2px 8px rgba(15,23,42,0.04); margin-bottom:1.15rem; }
-    .grid-2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:1.1rem; }
-    .grid-3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1.1rem; }
-    .form-row { margin-bottom:0.75rem; }
-    .form-row label { display:block; font-weight:600; margin-bottom:0.25rem; font-size:0.86rem; }
-    .form-row input, .form-row select, .form-row textarea { width:100%; padding:0.52rem 0.68rem; border:1px solid #cbd5e1; border-radius:6px; background:#fff; }
-    .tag { display:inline-block; background:#e0ecff; color:var(--primary-dark); font-size:0.74rem; font-weight:700; padding:0.18rem 0.5rem; border-radius:999px; margin-bottom:0.45rem; }
-    .price-strip { display:flex; justify-content:space-between; background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.6rem 0.75rem; margin:0.65rem 0; font-size:0.84rem; }
-    .banner { padding:0.75rem 1rem; border-radius:8px; margin-bottom:1rem; font-weight:600; font-size:0.88rem; }
-    .banner-info { background:#e0ecff; color:var(--primary-dark); }
-    .banner-ok { background:#dcfce7; color:var(--success); }
-    .banner-err { background:#fee2e2; color:var(--danger); }
-    .stat-box { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.9rem; text-align:center; }
-    .stat-num { font-size:1.4rem; font-weight:800; color:var(--primary); }
-    .stat-label { font-size:0.8rem; color:var(--muted); }
-    .module-item { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.7rem 0.85rem; margin-top:0.5rem; }
-    pre { background:#0f172a; color:#e2e8f0; padding:0.65rem; border-radius:6px; font-size:0.79rem; overflow-x:auto; margin-top:0.4rem; white-space:pre-wrap; }
+    .brand { font-size:1.1rem; font-weight:800; }
+    .tagline { font-size:0.75rem; color:#fcd34d; font-style:italic; }
+    .container { max-width:1180px; margin:1.4rem auto; padding:0 1rem; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin-bottom:1rem; }
+    .grid-3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:1rem; }
+    .banner { padding:0.75rem 1rem; border-radius:8px; margin-bottom:1rem; font-weight:600; background:#e0ecff; color:#003175; }
+    button { border:none; border-radius:6px; padding:0.46rem 0.85rem; font-weight:600; cursor:pointer; background:var(--primary); color:#fff; }
+    .tag { display:inline-block; background:#e0ecff; color:#003175; font-size:0.74rem; font-weight:700; padding:0.16rem 0.5rem; border-radius:999px; margin-bottom:0.4rem; }
   </style>
 </head>
 <body>
   <nav>
-    <div class="brand-wrap" onclick="switchSection('catalog')">
-      <div class="brand">Long life learning Academy</div>
-      <div class="tagline">We innovate to teach you Skills , Knowledges and develop you Possotive Mindset</div>
+    <div>
+      <div class="brand">${ACADEMY_NAME}</div>
+      <div class="tagline">${ACADEMY_TAGLINE}</div>
     </div>
-    <div class="nav-actions">
-      <button class="btn-ghost" onclick="switchSection('catalog')">Courses</button>
-      <button class="btn-ghost" onclick="switchSection('my-courses')">My Learning &amp; Upload</button>
-      <button class="btn-ghost" onclick="switchSection('resources-tools')">Library &amp; Tools</button>
-      <button class="btn-ghost" onclick="switchSection('ai-memory')">Open AI, CBL &amp; Memory</button>
-      <button class="btn-ghost" onclick="switchSection('auth')">Login / Register</button>
-      <button class="btn-accent" onclick="openAdminSection()">Admin (5405402)</button>
-      <button id="logout-btn" class="btn-danger hidden" onclick="logoutStudent()">Logout</button>
-    </div>
+    <button onclick="loadAll()">Refresh Status &amp; Catalog</button>
   </nav>
-
   <div class="container">
-    <div class="hero">
-      <h1>Long life learning Academy</h1>
-      <p>We innovate to teach you Skills , Knowledges and develop you Possotive Mindset</p>
-    </div>
-
-    <div id="status-banner" class="banner banner-info">Loading Long life learning Academy...</div>
-
-    <!-- 1. COURSE CATALOG -->
-    <section id="section-catalog">
-      <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem;">
-          <div>
-            <h2>Course Catalog (1M+ Course Capacity Ready)</h2>
-            <p style="color:var(--muted);font-size:0.88rem;">Any programming language • ETB (Telebirr / CBE Birr) &amp; USD (PayPal) • Gated PDF Certificates</p>
-          </div>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-            <input id="search-filter" type="text" placeholder="Search title or language..." oninput="renderCatalog()" style="padding:0.45rem 0.7rem;border:1px solid #cbd5e1;border-radius:6px;min-width:210px;" />
-            <button class="btn-primary" onclick="fetchCatalog(false)">Refresh</button>
-          </div>
-        </div>
-        <div id="catalog-grid" class="grid-3"></div>
-        <div style="margin-top:1rem;text-align:center;">
-          <button id="load-more-btn" class="btn-primary hidden" onclick="fetchCatalog(true)">Load More Courses</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- 2. MULTI-CHANNEL AUTH (EMAIL, PHONE, WHATSAPP, TELEGRAM + OTP + SOCIAL LINKS) -->
-    <section id="section-auth" class="hidden">
-      <div class="grid-2">
-        <div class="card">
-          <h3>Sign In (Email / Account)</h3>
-          <form onsubmit="handleLogin(event)">
-            <div class="form-row"><label>Email</label><input id="login-email" type="email" required placeholder="mohammedscho2023@gmail.com" /></div>
-            <div class="form-row"><label>Password</label><input id="login-password" type="password" required /></div>
-            <button type="submit" class="btn-primary">Sign In</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>Multi-Channel Learner Registration + OTP + Social Media Links</h3>
-          <div class="card" style="padding:0.85rem;background:#f8fafc;margin-bottom:0.85rem;">
-            <strong style="font-size:0.86rem;">Step 1: Verify Phone, WhatsApp, or Telegram (6-Digit Code)</strong>
-            <div class="grid-2" style="gap:0.5rem;margin-top:0.5rem;">
-              <select id="otp-channel">
-                <option value="PHONE">PHONE</option>
-                <option value="WHATSAPP">WHATSAPP</option>
-                <option value="TELEGRAM">TELEGRAM</option>
-              </select>
-              <input id="otp-target" type="text" placeholder="+2519... or @username" />
-            </div>
-            <div style="display:flex;gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap;">
-              <button type="button" class="btn-primary" onclick="handleRequestOtp()">Send Code</button>
-              <input id="otp-code" type="text" placeholder="6-digit code" style="width:120px;padding:0.42rem 0.6rem;border:1px solid #cbd5e1;border-radius:6px;" />
-              <button type="button" class="btn-success" onclick="handleVerifyOtp()">Verify Code</button>
-            </div>
-            <div id="otp-status" style="font-size:0.8rem;color:var(--muted);margin-top:0.4rem;"></div>
-          </div>
-
-          <form onsubmit="handleRegisterMulti(event)">
-            <div class="form-row"><label>Full Name</label><input id="reg-name" type="text" required /></div>
-            <div class="grid-2" style="gap:0.55rem;">
-              <div class="form-row"><label>Email (Optional if Phone/WhatsApp/Telegram)</label><input id="reg-email" type="email" /></div>
-              <div class="form-row"><label>Phone</label><input id="reg-phone" type="text" placeholder="+251..." /></div>
-              <div class="form-row"><label>WhatsApp</label><input id="reg-whatsapp" type="text" placeholder="+251..." /></div>
-              <div class="form-row"><label>Telegram</label><input id="reg-telegram" type="text" placeholder="@handle" /></div>
-            </div>
-            <div class="grid-2" style="gap:0.55rem;">
-              <div class="form-row"><label>LinkedIn URL</label><input id="soc-linkedin" type="text" placeholder="https://linkedin.com/in/..." /></div>
-              <div class="form-row"><label>YouTube / X / GitHub URL</label><input id="soc-github" type="text" placeholder="https://github.com/..." /></div>
-            </div>
-            <div class="form-row"><label>Password (min 6 chars)</label><input id="reg-password" type="password" minlength="6" required /></div>
-            <button type="submit" class="btn-success">Complete Registration</button>
-          </form>
-        </div>
-      </div>
-    </section>
-
-    <!-- 3. MY LEARNING, CODE SUBMISSIONS, CERTIFICATES & STUDENT COURSE UPLOAD -->
-    <section id="section-my-courses" class="hidden">
-      <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;">
-          <h2>My Enrolled Courses &amp; Gated PDF Certificates</h2>
-          <button class="btn-primary" onclick="fetchMyCourses()">Reload</button>
-        </div>
-        <div id="my-courses-list"></div>
-      </div>
-
-      <div class="grid-2">
-        <div class="card">
-          <h3>Submit Code for Automated Test Grading</h3>
-          <form onsubmit="handleSubmitCode(event)">
-            <div class="form-row"><label>Enrolled Course</label><select id="sub-course-select" required></select></div>
-            <div class="form-row"><label>Programming Language</label><input id="sub-lang" type="text" value="javascript" required /></div>
-            <div class="form-row"><label>Code</label><textarea id="sub-code" rows="4" required placeholder="function solve(input) { return input; }"></textarea></div>
-            <div class="form-row"><label>Notes (Optional)</label><input id="sub-notes" type="text" /></div>
-            <button type="submit" class="btn-success">Run Tests &amp; Submit</button>
-          </form>
-          <div id="my-submissions-list" style="margin-top:0.85rem;"></div>
-        </div>
-
-        <div class="card">
-          <h3>Upload a Course (Submitted for Admin Approval)</h3>
-          <form onsubmit="handleStudentCourseUpload(event)">
-            <div class="form-row"><label>Course Title</label><input id="up-title" type="text" required /></div>
-            <div class="form-row"><label>Programming Language / Track</label><input id="up-lang" type="text" value="Any Programming Language" required /></div>
-            <div class="form-row"><label>Description</label><textarea id="up-desc" rows="2" required></textarea></div>
-            <div class="form-row"><label>Starter Code / Lab Notes (Optional)</label><textarea id="up-code" rows="2"></textarea></div>
-            <button type="submit" class="btn-primary">Upload Course for Approval</button>
-          </form>
-        </div>
-      </div>
-    </section>
-
-    <!-- 4. LIBRARY OF RESOURCES, EXTERNAL TOOLS & BOOK/MODULE-TO-COURSE CONVERTER -->
-    <section id="section-resources-tools" class="hidden">
-      <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.65rem;margin-bottom:0.85rem;">
-          <div>
-            <h2>External Tools (Search Engines, AI Tools, Ed Tools, Servers, Apps)</h2>
-          </div>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-            <select id="tool-category-filter" onchange="fetchExternalTools()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;">
-              <option value="">All Categories</option>
-              <option value="SEARCH_ENGINE">SEARCH_ENGINE</option>
-              <option value="AI_TOOL">AI_TOOL</option>
-              <option value="EDUCATIONAL_TOOL">EDUCATIONAL_TOOL</option>
-              <option value="EDUCATIONAL_SERVER">EDUCATIONAL_SERVER</option>
-              <option value="APP">APP</option>
-            </select>
-            <button class="btn-primary" onclick="fetchExternalTools()">Refresh</button>
-          </div>
-        </div>
-        <div id="external-tools-grid" class="grid-3"></div>
-      </div>
-
-      <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.65rem;margin-bottom:0.85rem;">
-          <h2>Library of Resources</h2>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-            <select id="resource-type-filter" onchange="fetchResourceLibrary()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;">
-              <option value="">All Types</option>
-              <option value="BOOK">BOOK</option>
-              <option value="MODULE">MODULE</option>
-              <option value="GUIDE">GUIDE</option>
-              <option value="TEMPLATE">TEMPLATE</option>
-              <option value="CODE_PACK">CODE_PACK</option>
-            </select>
-            <input id="resource-search-input" type="text" placeholder="Search library..." oninput="renderResourceLibrary()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;" />
-            <button class="btn-primary" onclick="fetchResourceLibrary()">Refresh</button>
-          </div>
-        </div>
-        <div id="resource-library-grid" class="grid-3"></div>
-      </div>
-
-      <div class="card">
-        <h2>Convert Books, Modules &amp; Materials into Courses + Add Library &amp; Tools (Code 5405402)</h2>
-        <div class="grid-2" style="margin-top:0.75rem;">
-          <div class="card" style="margin:0;">
-            <h3>Book / Module → Course Converter</h3>
-            <form onsubmit="handleConvertMaterialToCourse(event)">
-              <div class="form-row"><label>Course Title</label><input id="conv-title" type="text" required /></div>
-              <div class="grid-2" style="gap:0.55rem;">
-                <div class="form-row"><label>Source Type</label><select id="conv-source-type"><option value="BOOK">BOOK</option><option value="MODULE">MODULE</option><option value="GUIDE">GUIDE</option><option value="CODE_PACK">CODE_PACK</option></select></div>
-                <div class="form-row"><label>Language / Track</label><input id="conv-lang" type="text" value="Any Programming Language" required /></div>
-              </div>
-              <div class="form-row"><label>Source URL (Optional)</label><input id="conv-url" type="url" placeholder="https://..." /></div>
-              <div class="form-row"><label>Chapters / Modules Text (Use <code># Chapter ...</code> or <code>Module 1: ...</code>)</label><textarea id="conv-text" rows="4" placeholder="# Chapter 1: Introduction&#10;Content...&#10;&#10;# Chapter 2: Practice&#10;Content..."></textarea></div>
-              <button type="submit" class="btn-success">Convert into Course</button>
-            </form>
-          </div>
-
-          <div>
-            <div class="card" style="margin-bottom:0.85rem;">
-              <h3>Add Item to Library of Resources</h3>
-              <form onsubmit="handleAddLibraryResource(event)">
-                <div class="form-row"><label>Title</label><input id="res-title" type="text" required /></div>
-                <div class="grid-2" style="gap:0.55rem;">
-                  <div class="form-row"><label>Type</label><select id="res-type"><option value="BOOK">BOOK</option><option value="MODULE">MODULE</option><option value="GUIDE">GUIDE</option><option value="TEMPLATE">TEMPLATE</option><option value="CODE_PACK">CODE_PACK</option></select></div>
-                  <div class="form-row"><label>URL (Optional)</label><input id="res-url" type="url" placeholder="https://..." /></div>
-                </div>
-                <div class="form-row"><label>Summary</label><input id="res-summary" type="text" /></div>
-                <button type="submit" class="btn-primary">Add to Library</button>
-              </form>
-            </div>
-
-            <div class="card" style="margin:0;">
-              <h3>Add External Tool</h3>
-              <form onsubmit="handleAddExternalTool(event)">
-                <div class="form-row"><label>Tool Name</label><input id="tool-name" type="text" required /></div>
-                <div class="grid-2" style="gap:0.55rem;">
-                  <div class="form-row"><label>Category</label><select id="tool-category"><option value="SEARCH_ENGINE">SEARCH_ENGINE</option><option value="AI_TOOL">AI_TOOL</option><option value="EDUCATIONAL_TOOL">EDUCATIONAL_TOOL</option><option value="EDUCATIONAL_SERVER">EDUCATIONAL_SERVER</option><option value="APP">APP</option></select></div>
-                  <div class="form-row"><label>URL</label><input id="tool-url" type="url" required placeholder="https://..." /></div>
-                </div>
-                <div class="form-row"><label>Description</label><input id="tool-desc" type="text" /></div>
-                <button type="submit" class="btn-accent">Add External Tool</button>
-              </form>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- 5. OPEN AI SYSTEM, LEARNING MONITOR, ADAPTIVE COURSES, CBL, MULTI-AGENT WORKFLOW & UNLIMITED MEMORY -->
-    <section id="section-ai-memory" class="hidden">
-      <div class="card">
-        <h2>Academy Open AI System, Prompt Improver, Multi-Agent Workflow &amp; Unlimited Memory</h2>
-        <div class="grid-2" style="margin-top:0.85rem;">
-          <div class="card" style="margin:0;">
-            <h3>Open AI Studio (Copilot / Claude Analyst / ChatGPT Coach / Breakthrough)</h3>
-            <form onsubmit="handleOpenAiStudio(event)">
-              <div class="grid-2" style="gap:0.55rem;">
-                <div class="form-row"><label>Mode</label><select id="oai-mode"><option value="COPILOT">COPILOT</option><option value="CLAUDE_ANALYST">CLAUDE_ANALYST</option><option value="CHATGPT_COACH" selected>CHATGPT_COACH</option><option value="BREAKTHROUGH">BREAKTHROUGH</option></select></div>
-                <div class="form-row"><label>Course (Optional)</label><select id="oai-course-select"></select></div>
-              </div>
-              <div class="form-row"><label>Prompt</label><textarea id="oai-prompt" rows="3" required placeholder="Ask for breakthrough ideas, code solutions, analysis, or coaching..."></textarea></div>
-              <button type="submit" class="btn-primary">Run Open AI</button>
-            </form>
-            <div id="oai-studio-output" style="margin-top:0.75rem;"></div>
-
-            <hr style="margin:1rem 0;border:none;border-top:1px solid var(--border);" />
-            <h3>Prompt-Driven Course &amp; Academy Improver (Code 5405402)</h3>
-            <form onsubmit="handleRunImprovementPrompt(event)">
-              <div class="grid-2" style="gap:0.55rem;">
-                <div class="form-row"><label>Scope</label><select id="imp-scope"><option value="COURSE">COURSE</option><option value="ACADEMY">ACADEMY</option></select></div>
-                <div class="form-row"><label>Course</label><select id="imp-course-select"></select></div>
-              </div>
-              <div class="form-row"><label>Improvement Prompt</label><textarea id="imp-prompt" rows="2" required placeholder="Improve course or academy via prompt..."></textarea></div>
-              <button type="submit" class="btn-success">Apply Improvement Prompt</button>
-            </form>
-            <div id="imp-result-box" style="margin-top:0.65rem;"></div>
-
-            <hr style="margin:1rem 0;border:none;border-top:1px solid var(--border);" />
-            <h3>Autonomous Multi-Agent Course Generator (1 Prompt → Full Course + Test Cases + Memory)</h3>
-            <form onsubmit="handleAutonomousCourseWorkflow(event)">
-              <div class="grid-2" style="gap:0.55rem;">
-                <div class="form-row"><label>Course Title (Optional)</label><input id="wf-title" type="text" /></div>
-                <div class="form-row"><label>Modules Count (2-10)</label><input id="wf-modules" type="number" min="2" max="10" value="4" required /></div>
-              </div>
-              <div class="form-row"><label>Single Prompt</label><textarea id="wf-prompt" rows="2" required placeholder="Generate a complete multi-module course with test cases..."></textarea></div>
-              <button type="submit" class="btn-accent">Generate Full Course Autonomously</button>
-            </form>
-            <div id="wf-result-box" style="margin-top:0.65rem;"></div>
-          </div>
-
-          <div>
-            <div class="card" style="margin-bottom:0.9rem;">
-              <h3>AI Learning Monitor, Adaptive Course &amp; Competence-Based Learning (CBL)</h3>
-              <form onsubmit="handleMonitorAndAdapt(event)">
-                <div class="grid-2" style="gap:0.55rem;">
-                  <div class="form-row"><label>Course</label><select id="adapt-course-select"></select></div>
-                  <div class="form-row"><label>Pace</label><select id="adapt-pace"><option value="ADAPTIVE">ADAPTIVE</option><option value="FOUNDATIONAL">FOUNDATIONAL</option><option value="FAST_TRACK">FAST_TRACK</option></select></div>
-                  <div class="form-row"><label>Score (0-100)</label><input id="mon-score" type="number" min="0" max="100" value="85" /></div>
-                  <div class="form-row"><label>Minutes</label><input id="mon-minutes" type="number" min="0" value="25" /></div>
-                </div>
-                <div class="form-row"><label>Goal / Mindset Note</label><input id="adapt-goal" type="text" /></div>
-                <button type="submit" class="btn-success">Monitor &amp; Adapt</button>
-              </form>
-              <div id="adapt-output" style="margin-top:0.6rem;"></div>
-
-              <form onsubmit="handleCompetenceAssess(event)" style="margin-top:0.85rem;">
-                <div class="grid-2" style="gap:0.55rem;">
-                  <div class="form-row"><label>Competency Name</label><input id="cbl-name" type="text" required placeholder="Applied Coding & Positive Mindset" /></div>
-                  <div class="form-row"><label>Evidence Score (0-100)</label><input id="cbl-score" type="number" min="0" max="100" value="88" required /></div>
-                </div>
-                <button type="submit" class="btn-primary">Record Competence</button>
-              </form>
-              <div id="cbl-list" style="margin-top:0.6rem;"></div>
-            </div>
-
-            <div class="card" style="margin:0;">
-              <h3>Unlimited Persistent Memory (<code>academy-memory.jsonl</code>)</h3>
-              <div style="display:flex;gap:0.45rem;margin-bottom:0.55rem;flex-wrap:wrap;">
-                <input id="mem-search-q" type="text" placeholder="Search unlimited memory..." style="flex:1;min-width:150px;padding:0.42rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;" />
-                <button type="button" class="btn-primary" onclick="fetchUnlimitedMemory(false)">Search</button>
-                <button type="button" class="btn-accent" onclick="handleExportMemoryJsonl()">Export .jsonl</button>
-              </div>
-              <div id="mem-stats-line" style="font-size:0.78rem;color:var(--muted);margin-bottom:0.45rem;"></div>
-              <div id="mem-list"></div>
-              <button id="mem-load-more" type="button" class="btn-ghost hidden" style="color:var(--primary);border:1px solid var(--primary);margin-top:0.45rem;" onclick="fetchUnlimitedMemory(true)">Load Older</button>
-
-              <div class="form-row" style="margin-top:0.75rem;">
-                <label style="font-size:0.8rem;">Import JSONL Lines (Admin Code 5405402)</label>
-                <textarea id="mem-import-jsonl" rows="2" placeholder='{"id":"mem_custom","scope":"ACADEMY","title":"Note","content":"..."}'></textarea>
-              </div>
-              <button type="button" class="btn-success" onclick="handleImportMemoryJsonl()">Import Backup</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- 6. ADMIN STUDIO (ADD INSTRUCTORS, APPROVE COURSES, ANALYTICS) -->
-    <section id="section-admin" class="hidden">
-      <div class="card">
-        <h2>Admin Studio — Long life learning Academy (Code: 5405402)</h2>
-        <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;margin:0.65rem 0 1rem;">
-          <input id="admin-code-input" type="password" value="5405402" style="padding:0.48rem 0.7rem;border:1px solid #cbd5e1;border-radius:6px;width:190px;" />
-          <button class="btn-primary" onclick="fetchAdminDashboard()">Load Analytics &amp; Review Queue</button>
-        </div>
-
-        <div class="grid-3" style="margin-bottom:1rem;">
-          <div class="stat-box"><div class="stat-num" id="stat-students">0</div><div class="stat-label">Total Learners</div></div>
-          <div class="stat-box"><div class="stat-num" id="stat-courses">0</div><div class="stat-label">Total Courses</div></div>
-          <div class="stat-box"><div class="stat-num" id="stat-enrollments">0</div><div class="stat-label">Completed Enrollments</div></div>
-          <div class="stat-box"><div class="stat-num" id="stat-etb">0.00 ETB</div><div class="stat-label">Revenue (ETB)</div></div>
-          <div class="stat-box"><div class="stat-num" id="stat-usd">$0.00</div><div class="stat-label">Revenue (USD)</div></div>
-        </div>
-
-        <div class="grid-2">
-          <div class="card" style="margin:0;">
-            <h3>Add Instructor</h3>
-            <form onsubmit="handleAddInstructor(event)">
-              <div class="form-row"><label>Instructor Name</label><input id="inst-name" type="text" required /></div>
-              <div class="grid-2" style="gap:0.55rem;">
-                <div class="form-row"><label>Email</label><input id="inst-email" type="email" /></div>
-                <div class="form-row"><label>Phone / WhatsApp</label><input id="inst-phone" type="text" /></div>
-              </div>
-              <div class="form-row"><label>Specialties</label><input id="inst-spec" type="text" value="Skills, Knowledge & Positive Mindset" /></div>
-              <button type="submit" class="btn-success">Add Instructor</button>
-            </form>
-            <div id="instructors-list" style="margin-top:0.75rem;"></div>
-          </div>
-
-          <div class="card" style="margin:0;">
-            <h3>Course Approval Queue</h3>
-            <div id="admin-review-queue"></div>
-          </div>
-        </div>
-      </div>
-    </section>
+    <div id="banner" class="banner">Connecting to ${ACADEMY_NAME} API...</div>
+    <div id="courses" class="grid-3"></div>
   </div>
-
   <script>
     const API = window.location.origin + "/api";
-    const MASTER_ADMIN_CODE = "5405402";
-    let catalogCourses = [];
-    let nextCursor = null;
-    let enrolledList = [];
-    let enrolledCourseIds = new Set();
-    let libraryResources = [];
-    let externalToolsList = [];
-    let memoryNextCursor = null;
-    let verifiedContactToken = "";
-    let authToken = localStorage.getItem("lms_token") || "";
-    let currentUser = JSON.parse(localStorage.getItem("lms_user") || "null");
-
-    function escapeHtml(s) {
-      return String(s ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    function escapeAttrUrl(u) {
-      const s = String(u ?? "").trim();
-      return /^https?:\/\//i.test(s) ? escapeHtml(s) : "#";
-    }
-
-    function setBanner(msg, type = "info") {
-      const el = document.getElementById("status-banner");
-      el.className = "banner banner-" + type;
-      el.textContent = msg + " | Learner: " + (currentUser ? currentUser.name + " (" + currentUser.email + ")" : "Guest");
-    }
-
-    function updateSessionUI() {
-      document.getElementById("logout-btn").classList.toggle("hidden", !(currentUser && authToken));
-      setBanner(currentUser ? "Signed in to Long life learning Academy" : "Welcome to Long life learning Academy");
-    }
-
-    function switchSection(id) {
-      ["catalog", "auth", "my-courses", "resources-tools", "ai-memory", "admin"].forEach((s) =>
-        document.getElementById("section-" + s)?.classList.toggle("hidden", s !== id)
-      );
-      if (id === "catalog") fetchCatalog(false);
-      if (id === "my-courses") {
-        fetchMyCourses();
-        fetchMySubmissions();
-      }
-      if (id === "resources-tools") {
-        fetchExternalTools();
-        fetchResourceLibrary();
-      }
-      if (id === "ai-memory") {
-        populateCourseSelectors();
-        fetchUnlimitedMemory(false);
-      }
-      if (id === "admin") {
-        fetchAdminDashboard();
-      }
-    }
-
-    function openAdminSection() {
-      const code = prompt("Enter Master Admin Code:");
-      if (code !== MASTER_ADMIN_CODE) {
-        setBanner("Invalid Admin Code.", "err");
-        return;
-      }
-      document.getElementById("admin-code-input").value = code;
-      switchSection("admin");
-    }
-
-    function getAdminCode() {
-      return (document.getElementById("admin-code-input")?.value || MASTER_ADMIN_CODE).trim();
-    }
-
-    function populateCourseSelectors() {
-      const opts = (catalogCourses || []).map(
-        (c) => '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.title) + "</option>"
-      );
-      const oaiSel = document.getElementById("oai-course-select");
-      const impSel = document.getElementById("imp-course-select");
-      const adaptSel = document.getElementById("adapt-course-select");
-      if (oaiSel) oaiSel.innerHTML = '<option value="">Academy-Wide</option>' + opts.join("");
-      if (impSel) impSel.innerHTML = opts.join("") || '<option value="">No courses</option>';
-      if (adaptSel) adaptSel.innerHTML = opts.join("") || '<option value="">No courses</option>';
-    }
-
-    async function fetchCatalog(append = false) {
+    function esc(s) { return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+    async function loadAll() {
       try {
-        const url = API + "/courses?limit=24" + (append && nextCursor ? "&cursor=" + encodeURIComponent(nextCursor) : "");
-        const r = await fetch(url);
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to load catalog");
-        catalogCourses = append ? catalogCourses.concat(d.courses || []) : d.courses || [];
-        nextCursor = d.pageInfo?.nextCursor || null;
-        document.getElementById("load-more-btn").classList.toggle("hidden", !d.pageInfo?.hasMore);
-        populateCourseSelectors();
-        renderCatalog();
+        const [hRes, cRes] = await Promise.all([fetch(API + "/health"), fetch(API + "/courses?limit=12")]);
+        const h = await hRes.json();
+        const c = await cRes.json();
+        document.getElementById("banner").textContent = "API Status: " + (h.status || "ok") + " | DB: " + (h.database || "ok") + " | Courses loaded: " + (c.courses?.length || 0);
+        document.getElementById("courses").innerHTML = (c.courses || []).map(x =>
+          '<div class="card"><span class="tag">' + esc(x.programmingLanguage || "Any Language") + '</span><h3>' + esc(x.title) + '</h3><p style="color:#64748b;font-size:0.86rem;margin-top:0.35rem">' + esc(x.description) + '</p></div>'
+        ).join("") || '<div class="card"><p style="color:#64748b">No courses published yet. Use POST /api/admin/courses or POST /api/admin/courses/seed-bulk with x-admin-code: ${ADMIN_MASTER_CODE}.</p></div>';
       } catch (e) {
-        setBanner(e.message, "err");
+        document.getElementById("banner").textContent = "Error: " + e.message;
       }
     }
-
-    function renderCatalog() {
-      const q = (document.getElementById("search-filter")?.value || "").trim().toLowerCase();
-      const list = catalogCourses.filter(
-        (c) =>
-          !q ||
-          (c.programmingLanguage || "").toLowerCase().includes(q) ||
-          (c.title || "").toLowerCase().includes(q)
-      );
-      const grid = document.getElementById("catalog-grid");
-      if (!list.length) {
-        grid.innerHTML = '<p style="color:var(--muted)">No published courses match yet.</p>';
-        return;
-      }
-      grid.innerHTML = list
-        .map((c, i) => {
-          const done = enrolledCourseIds.has(c.id);
-          return (
-            '<div class="card" style="margin:0;display:flex;flex-direction:column;justify-content:space-between"><div>' +
-            '<span class="tag">' + escapeHtml(c.programmingLanguage || "Any Programming Language") + "</span>" +
-            "<h3>" + escapeHtml(c.title) + "</h3>" +
-            '<p style="color:var(--muted);font-size:0.86rem;margin:0.35rem 0">' + escapeHtml(c.description) + "</p>" +
-            '<div class="price-strip"><div><strong>ETB:</strong> ' + escapeHtml(c.priceETB) + ' Birr<br/><span style="color:var(--muted);font-size:0.76rem">Cert: ' + escapeHtml(c.certFeeETB) + " Birr</span></div>" +
-            '<div style="text-align:right"><strong>USD:</strong> $' + escapeHtml(c.priceUSD) + '<br/><span style="color:var(--muted);font-size:0.76rem">Cert: $' + escapeHtml(c.certFeeUSD) + "</span></div></div></div>" +
-            '<div><div class="form-row" style="margin-bottom:0.45rem"><select id="pay-opt-' + i + '"' + (done ? " disabled" : "") + '><option value="ETB|TELEBIRR">Telebirr (ETB)</option><option value="ETB|CBE_BIRR">CBE Birr (ETB)</option><option value="USD|PAYPAL">PayPal (USD)</option></select></div>' +
-            '<button class="' + (done ? "btn-success" : "btn-primary") + '" style="width:100%"' + (done ? " disabled" : "") + ' onclick="enrollCourse(\'' + escapeHtml(c.id) + "'," + i + ')">' + (done ? "Enrolled" : "Enroll Now") + "</button></div></div>"
-          );
-        })
-        .join("");
-    }
-
-    async function handleRequestOtp() {
-      try {
-        const channel = document.getElementById("otp-channel").value;
-        const target = document.getElementById("otp-target").value.trim();
-        const r = await fetch(API + "/auth/request-otp", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ channel, target }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "OTP request failed");
-        document.getElementById("otp-status").textContent =
-          d.message + (d.devPreviewCode ? " [Dev Code: " + d.devPreviewCode + "]" : "");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function handleVerifyOtp() {
-      try {
-        const channel = document.getElementById("otp-channel").value;
-        const target = document.getElementById("otp-target").value.trim();
-        const code = document.getElementById("otp-code").value.trim();
-        const r = await fetch(API + "/auth/verify-otp", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ channel, target, code }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "OTP verification failed");
-        verifiedContactToken = d.verificationToken;
-        document.getElementById("otp-status").textContent = "Verified " + channel + " (" + target + ")";
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function handleRegisterMulti(e) {
-      e.preventDefault();
-      try {
-        const socialLinks = {};
-        const li = document.getElementById("soc-linkedin").value.trim();
-        const gh = document.getElementById("soc-github").value.trim();
-        if (li) socialLinks.linkedin = li;
-        if (gh) socialLinks.github = gh;
-
-        const r = await fetch(API + "/auth/register-multi", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: document.getElementById("reg-name").value.trim(),
-            email: document.getElementById("reg-email").value.trim() || undefined,
-            phone: document.getElementById("reg-phone").value.trim() || undefined,
-            whatsapp: document.getElementById("reg-whatsapp").value.trim() || undefined,
-            telegram: document.getElementById("reg-telegram").value.trim() || undefined,
-            socialLinks,
-            verificationToken: verifiedContactToken || undefined,
-            password: document.getElementById("reg-password").value,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Registration failed");
-        authToken = d.token;
-        currentUser = d.user;
-        localStorage.setItem("lms_token", authToken);
-        localStorage.setItem("lms_user", JSON.stringify(currentUser));
-        updateSessionUI();
-        switchSection("catalog");
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleLogin(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            email: document.getElementById("login-email").value.trim(),
-            password: document.getElementById("login-password").value,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Login failed");
-        authToken = d.token;
-        currentUser = d.user;
-        localStorage.setItem("lms_token", authToken);
-        localStorage.setItem("lms_user", JSON.stringify(currentUser));
-        updateSessionUI();
-        await fetchMyCourses();
-        await fetchMySubmissions();
-        switchSection("my-courses");
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    function logoutStudent() {
-      authToken = "";
-      currentUser = null;
-      enrolledList = [];
-      enrolledCourseIds.clear();
-      localStorage.removeItem("lms_token");
-      localStorage.removeItem("lms_user");
-      updateSessionUI();
-      renderCatalog();
-      switchSection("catalog");
-    }
-
-    async function enrollCourse(courseId, idx) {
-      if (!authToken) {
-        setBanner("Please sign in or register first.", "err");
-        switchSection("auth");
-        return;
-      }
-      const [currency, paymentMethod] = document.getElementById("pay-opt-" + idx).value.split("|");
-      try {
-        const r = await fetch(API + "/enroll", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
-          body: JSON.stringify({ courseId, currency, paymentMethod }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Enrollment failed");
-        enrolledCourseIds.add(courseId);
-        renderCatalog();
-        setBanner("Enrolled! Ref: " + d.transaction.providerRef, "ok");
-        switchSection("my-courses");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function fetchMyCourses() {
-      if (!authToken) {
-        document.getElementById("my-courses-list").innerHTML = '<p style="color:var(--muted)">Sign in to view enrolled courses.</p>';
-        return;
-      }
-      try {
-        const r = await fetch(API + "/my-courses", { headers: { Authorization: "Bearer " + authToken } });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to load courses");
-        enrolledList = d.enrollments || [];
-        enrolledCourseIds = new Set(enrolledList.map((x) => x.courseId));
-        renderCatalog();
-
-        const sel = document.getElementById("sub-course-select");
-        if (sel) {
-          sel.innerHTML =
-            enrolledList.map((x) => '<option value="' + escapeHtml(x.courseId) + '">' + escapeHtml(x.course.title) + "</option>").join("") ||
-            '<option value="">Enroll in a course first</option>';
-        }
-
-        const el = document.getElementById("my-courses-list");
-        if (!enrolledList.length) {
-          el.innerHTML = '<p style="color:var(--muted)">No enrollments yet.</p>';
-          return;
-        }
-        el.innerHTML = enrolledList
-          .map((enr, idx) => {
-            const c = enr.course;
-            const issued = enr.certificateStatus === "ISSUED";
-            const certBtns = issued
-              ? '<button class="btn-success" onclick="downloadIssuedCertificate(\'' + escapeHtml(c.id) + "')\">Download PDF Certificate</button>"
-              : '<select id="cert-opt-' + idx + '"><option value="ETB|TELEBIRR">Telebirr (ETB)</option><option value="ETB|CBE_BIRR">CBE Birr (ETB)</option><option value="USD|PAYPAL">PayPal (USD)</option></select><button class="btn-success" onclick="payAndDownloadCertificate(\'' + escapeHtml(c.id) + "'," + idx + ')">Pay &amp; Download PDF</button>';
-            return (
-              '<div class="card"><div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:0.5rem"><div><span class="tag">' +
-              escapeHtml(c.programmingLanguage || "Any Language") +
-              "</span><h3>" +
-              escapeHtml(c.title) +
-              '</h3><p style="font-size:0.86rem;color:var(--muted)">Certificate: <strong>' +
-              escapeHtml(enr.certificateStatus) +
-              '</strong></p></div><div style="display:flex;gap:0.45rem;flex-wrap:wrap">' +
-              certBtns +
-              "</div></div></div>"
-            );
-          })
-          .join("");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function handleSubmitCode(e) {
-      e.preventDefault();
-      if (!authToken) {
-        setBanner("Sign in first.", "err");
-        return;
-      }
-      const courseId = document.getElementById("sub-course-select").value;
-      if (!courseId) return;
-      try {
-        const r = await fetch(API + "/submissions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
-          body: JSON.stringify({
-            courseId,
-            language: document.getElementById("sub-lang").value.trim(),
-            code: document.getElementById("sub-code").value,
-            notes: document.getElementById("sub-notes").value.trim(),
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Submission failed");
-        setBanner("Score: " + d.evaluation.score + "% (" + d.evaluation.status + ")", "ok");
-        await fetchMySubmissions();
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function fetchMySubmissions() {
-      if (!authToken) return;
-      try {
-        const r = await fetch(API + "/submissions", { headers: { Authorization: "Bearer " + authToken } });
-        const d = await r.json();
-        if (!r.ok) return;
-        document.getElementById("my-submissions-list").innerHTML = (d.submissions || [])
-          .map(
-            (s) =>
-              '<div class="module-item"><strong>' +
-              escapeHtml(s.language) +
-              '</strong> <span class="tag">' +
-              escapeHtml(String(s.evaluation?.score ?? 0)) +
-              "% • " +
-              escapeHtml(s.evaluation?.status || "") +
-              "</span><pre>" +
-              escapeHtml(s.code) +
-              "</pre></div>"
-          )
-          .join("");
-      } catch (_) {}
-    }
-
-    async function handleStudentCourseUpload(e) {
-      e.preventDefault();
-      if (!authToken) {
-        setBanner("Sign in first to upload a course.", "err");
-        return;
-      }
-      try {
-        const r = await fetch(API + "/student-courses/upload", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
-          body: JSON.stringify({
-            title: document.getElementById("up-title").value.trim(),
-            programmingLanguage: document.getElementById("up-lang").value.trim(),
-            description: document.getElementById("up-desc").value.trim(),
-            starterCode: document.getElementById("up-code").value || undefined,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Upload failed");
-        e.target.reset();
-        setBanner(d.message || "Uploaded for admin approval.", "ok");
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function saveBlobResponse(res, fallbackName) {
-      const blob = await res.blob();
-      const disp = res.headers.get("Content-Disposition") || "";
-      const m = disp.match(/filename="?([^";]+)"?/i);
-      const name = m ? m[1] : fallbackName;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }
-
-    async function payAndDownloadCertificate(courseId, idx) {
-      const [currency, paymentMethod] = document.getElementById("cert-opt-" + idx).value.split("|");
-      try {
-        const r = await fetch(API + "/certificate/" + encodeURIComponent(courseId), {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
-          body: JSON.stringify({ currency, paymentMethod }),
-        });
-        if (!r.ok) {
-          const d = await r.json().catch(() => ({}));
-          throw new Error(d.error || "Certificate locked or payment failed");
-        }
-        await saveBlobResponse(r, "Certificate.pdf");
-        setBanner("Certificate issued and PDF downloaded!", "ok");
-        fetchMyCourses();
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function downloadIssuedCertificate(courseId) {
-      try {
-        const r = await fetch(API + "/certificate/" + encodeURIComponent(courseId) + "/download", {
-          headers: { Authorization: "Bearer " + authToken },
-        });
-        if (!r.ok) {
-          const d = await r.json().catch(() => ({}));
-          throw new Error(d.error || "Download failed");
-        }
-        await saveBlobResponse(r, "Certificate.pdf");
-        setBanner("Certificate PDF downloaded!", "ok");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function fetchExternalTools() {
-      try {
-        const cat = document.getElementById("tool-category-filter")?.value || "";
-        const r = await fetch(API + "/external-tools" + (cat ? "?category=" + encodeURIComponent(cat) : ""));
-        const d = await r.json();
-        externalToolsList = d.tools || [];
-        document.getElementById("external-tools-grid").innerHTML = externalToolsList
-          .map(
-            (t) =>
-              '<div class="card" style="margin:0"><div><span class="tag">' +
-              escapeHtml(t.category) +
-              "</span><h3>" +
-              escapeHtml(t.name) +
-              '</h3><p style="color:var(--muted);font-size:0.84rem;margin:0.35rem 0 0.7rem">' +
-              escapeHtml(t.description || "") +
-              '</p></div><a href="' +
-              escapeAttrUrl(t.url) +
-              '" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:var(--primary);color:#fff;padding:0.42rem 0.8rem;border-radius:6px;text-decoration:none;font-size:0.84rem;font-weight:600">Open Tool ↗</a></div>'
-          )
-          .join("");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function fetchResourceLibrary() {
-      try {
-        const type = document.getElementById("resource-type-filter")?.value || "";
-        const r = await fetch(API + "/resources" + (type ? "?type=" + encodeURIComponent(type) : ""));
-        const d = await r.json();
-        libraryResources = d.resources || [];
-        renderResourceLibrary();
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    function renderResourceLibrary() {
-      const q = (document.getElementById("resource-search-input")?.value || "").trim().toLowerCase();
-      const filtered = libraryResources.filter(
-        (r) => !q || r.title.toLowerCase().includes(q) || (r.summary || "").toLowerCase().includes(q)
-      );
-      document.getElementById("resource-library-grid").innerHTML = filtered
-        .map(
-          (r) =>
-            '<div class="card" style="margin:0"><span class="tag">' +
-            escapeHtml(r.resourceType) +
-            "</span><h3>" +
-            escapeHtml(r.title) +
-            '</h3><p style="color:var(--muted);font-size:0.84rem;margin:0.35rem 0">' +
-            escapeHtml(r.summary || "") +
-            '</p>' +
-            (r.url ? '<a href="' + escapeAttrUrl(r.url) + '" target="_blank" rel="noopener noreferrer">Open Resource ↗</a>' : "") +
-            "</div>"
-        )
-        .join("");
-    }
-
-    async function handleConvertMaterialToCourse(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/admin/courses/convert-source", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            courseTitle: document.getElementById("conv-title").value.trim(),
-            sourceType: document.getElementById("conv-source-type").value,
-            programmingLanguage: document.getElementById("conv-lang").value.trim(),
-            sourceUrl: document.getElementById("conv-url").value.trim() || undefined,
-            sourceText: document.getElementById("conv-text").value,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Conversion failed");
-        e.target.reset();
-        setBanner(d.message || "Converted into course!", "ok");
-        await Promise.all([fetchCatalog(false), fetchResourceLibrary()]);
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleAddLibraryResource(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/admin/resources", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            title: document.getElementById("res-title").value.trim(),
-            resourceType: document.getElementById("res-type").value,
-            url: document.getElementById("res-url").value.trim() || undefined,
-            summary: document.getElementById("res-summary").value.trim() || undefined,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to add resource");
-        e.target.reset();
-        setBanner("Added to Resource Library.", "ok");
-        await fetchResourceLibrary();
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleAddExternalTool(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/admin/external-tools", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            name: document.getElementById("tool-name").value.trim(),
-            category: document.getElementById("tool-category").value,
-            url: document.getElementById("tool-url").value.trim(),
-            description: document.getElementById("tool-desc").value.trim() || undefined,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to add external tool");
-        e.target.reset();
-        setBanner("Added external tool.", "ok");
-        await fetchExternalTools();
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleOpenAiStudio(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/open-ai/studio", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: document.getElementById("oai-mode").value,
-            courseId: document.getElementById("oai-course-select").value || undefined,
-            prompt: document.getElementById("oai-prompt").value.trim(),
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Open AI failed");
-        document.getElementById("oai-studio-output").innerHTML =
-          '<div class="module-item"><strong>' + escapeHtml(d.mode?.label || "") + '</strong> <span class="tag">' + escapeHtml(d.provider) + "</span><pre>" + escapeHtml(d.output) + "</pre></div>";
-        await fetchUnlimitedMemory(false);
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleRunImprovementPrompt(e) {
-      e.preventDefault();
-      try {
-        const scope = document.getElementById("imp-scope").value;
-        const r = await fetch(API + "/ai/agent/run", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            targetScope: scope,
-            courseId: scope === "COURSE" ? document.getElementById("imp-course-select").value : null,
-            prompt: document.getElementById("imp-prompt").value.trim(),
-            autoApply: true,
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Improvement failed");
-        document.getElementById("imp-result-box").innerHTML =
-          '<div class="module-item"><strong>Applied (' + escapeHtml(d.provider) + ")</strong><pre>" + escapeHtml(d.aiNarrative) + "</pre></div>";
-        await Promise.all([fetchCatalog(false), fetchUnlimitedMemory(false)]);
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleAutonomousCourseWorkflow(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/ai/workflow/create-course", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            courseTitle: document.getElementById("wf-title").value.trim() || undefined,
-            moduleCount: Number(document.getElementById("wf-modules").value || 4),
-            prompt: document.getElementById("wf-prompt").value.trim(),
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Workflow failed");
-        e.target.reset();
-        document.getElementById("wf-result-box").innerHTML =
-          '<div class="module-item"><strong>Created: ' + escapeHtml(d.course.title) + '</strong> <span class="tag">' + escapeHtml(String(d.testCasesCount || 0)) + " test cases</span></div>";
-        await Promise.all([fetchCatalog(false), fetchUnlimitedMemory(false)]);
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleMonitorAndAdapt(e) {
-      e.preventDefault();
-      if (!authToken) {
-        setBanner("Sign in first.", "err");
-        return;
-      }
-      try {
-        const courseId = document.getElementById("adapt-course-select").value;
-        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + authToken };
-        const mon = await fetch(API + "/open-ai/monitor/track", {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            courseId,
-            score: Number(document.getElementById("mon-score").value),
-            timeSpentMinutes: Number(document.getElementById("mon-minutes").value || 0),
-            mindsetNote: document.getElementById("adapt-goal").value.trim(),
-          }),
-        });
-        const ad = await fetch(API + "/open-ai/adapt-course", {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            courseId,
-            goal: document.getElementById("adapt-goal").value.trim(),
-            pace: document.getElementById("adapt-pace").value,
-          }),
-        });
-        const mData = await mon.json();
-        const aData = await ad.json();
-        document.getElementById("adapt-output").innerHTML =
-          '<div class="module-item"><strong>' + escapeHtml(mData.telemetry?.learningSignal || "") + " • " + escapeHtml(aData.adaptation?.pace || "") + "</strong></div>";
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleCompetenceAssess(e) {
-      e.preventDefault();
-      if (!authToken) {
-        setBanner("Sign in first.", "err");
-        return;
-      }
-      try {
-        const r = await fetch(API + "/open-ai/competence/assess", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
-          body: JSON.stringify({
-            courseId: document.getElementById("adapt-course-select")?.value || "general",
-            competencyName: document.getElementById("cbl-name").value.trim(),
-            evidenceScore: Number(document.getElementById("cbl-score").value),
-          }),
-        });
-        const d = await r.json();
-        document.getElementById("cbl-list").innerHTML = (d.allCompetencies || [])
-          .map((c) => '<div class="module-item"><strong>' + escapeHtml(c.competencyName) + '</strong> <span class="tag">' + escapeHtml(c.level) + " (" + escapeHtml(String(c.bestScore)) + "%)</span></div>")
-          .join("");
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function fetchUnlimitedMemory(append = false) {
-      try {
-        const q = encodeURIComponent((document.getElementById("mem-search-q")?.value || "").trim());
-        const cur = append && memoryNextCursor ? "&cursor=" + encodeURIComponent(memoryNextCursor) : "";
-        const r = await fetch(API + "/memory?limit=12&q=" + q + cur);
-        const d = await r.json();
-        memoryNextCursor = d.pageInfo?.nextCursor || null;
-        if (d.stats) {
-          document.getElementById("mem-stats-line").textContent =
-            "Records: " + d.stats.totalRecords + " | Disk: " + d.stats.diskSizeMB + " MB | Unlimited";
-        }
-        const html = (d.memories || [])
-          .map((m) => '<div class="module-item"><strong>' + escapeHtml(m.title) + '</strong> <span class="tag">' + escapeHtml(m.scope) + '</span><p style="font-size:0.8rem;margin-top:0.2rem">' + escapeHtml(m.content.slice(0, 300)) + "</p></div>")
-          .join("");
-        const box = document.getElementById("mem-list");
-        box.innerHTML = append ? box.innerHTML + html : html;
-        document.getElementById("mem-load-more")?.classList.toggle("hidden", !d.pageInfo?.hasMore);
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function handleExportMemoryJsonl() {
-      const r = await fetch(API + "/memory/export");
-      const text = await r.text();
-      const blob = new Blob([text], { type: "application/x-ndjson;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "academy-memory-" + new Date().toISOString().slice(0, 10) + ".jsonl";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }
-
-    async function handleImportMemoryJsonl() {
-      try {
-        const jsonlText = (document.getElementById("mem-import-jsonl")?.value || "").trim();
-        const r = await fetch(API + "/memory/import", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({ jsonlText }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Import failed");
-        setBanner(d.message, "ok");
-        await fetchUnlimitedMemory(false);
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    async function handleAddInstructor(e) {
-      e.preventDefault();
-      try {
-        const r = await fetch(API + "/admin/instructors", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({
-            name: document.getElementById("inst-name").value.trim(),
-            email: document.getElementById("inst-email").value.trim() || undefined,
-            phone: document.getElementById("inst-phone").value.trim() || undefined,
-            specialties: document.getElementById("inst-spec").value.trim(),
-          }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to add instructor");
-        e.target.reset();
-        setBanner("Added instructor: " + d.instructor.name, "ok");
-        fetchAdminDashboard();
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function handleReviewCourse(courseId, action) {
-      try {
-        const r = await fetch(API + "/admin/courses/" + encodeURIComponent(courseId) + "/approve", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
-          body: JSON.stringify({ action }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Review failed");
-        setBanner("Course " + action + "D.", "ok");
-        await Promise.all([fetchCatalog(false), fetchAdminDashboard()]);
-      } catch (err) {
-        setBanner(err.message, "err");
-      }
-    }
-
-    async function fetchAdminDashboard() {
-      try {
-        const headers = { "x-admin-code": getAdminCode() };
-        const [aRes, qRes, iRes] = await Promise.all([
-          fetch(API + "/admin/analytics", { headers }),
-          fetch(API + "/admin/courses/review-queue", { headers }),
-          fetch(API + "/instructors"),
-        ]);
-        const aData = await aRes.json();
-        if (!aRes.ok) throw new Error(aData.error || "Analytics failed");
-        const qData = await qRes.json();
-        const iData = await iRes.json();
-
-        document.getElementById("stat-students").textContent = aData.totalStudents ?? 0;
-        document.getElementById("stat-courses").textContent = aData.totalCourses ?? 0;
-        document.getElementById("stat-enrollments").textContent = aData.totalEnrollments ?? 0;
-        document.getElementById("stat-etb").textContent = Number(aData.revenue?.ETB || 0).toFixed(2) + " ETB";
-        document.getElementById("stat-usd").textContent = "$" + Number(aData.revenue?.USD || 0).toFixed(2);
-
-        document.getElementById("instructors-list").innerHTML = (iData.instructors || [])
-          .map((ins) => '<div class="module-item"><strong>' + escapeHtml(ins.name) + '</strong> — ' + escapeHtml((ins.specialties || []).join(", ")) + "</div>")
-          .join("");
-
-        document.getElementById("admin-review-queue").innerHTML = (qData.courses || []).slice(0, 15)
-          .map((c) => {
-            const st = c.approval?.status || (c.isPublished ? "APPROVED" : "PENDING_APPROVAL");
-            return (
-              '<div class="module-item"><strong>' +
-              escapeHtml(c.title) +
-              '</strong> <span class="tag">' +
-              escapeHtml(st) +
-              '</span><div style="display:flex;gap:0.4rem;margin-top:0.35rem"><button class="btn-success" onclick="handleReviewCourse(\'' +
-              escapeHtml(c.id) +
-              "','APPROVE')\">Approve</button><button class=\"btn-danger\" onclick=\"handleReviewCourse('" +
-              escapeHtml(c.id) +
-              "','REJECT')\">Reject</button></div></div>"
-            );
-          })
-          .join("");
-      } catch (e) {
-        setBanner(e.message, "err");
-      }
-    }
-
-    updateSessionUI();
-    fetchCatalog(false);
-    if (authToken) {
-      fetchMyCourses();
-      fetchMySubmissions();
-    }
+    loadAll();
   </script>
 </body>
-</html>`;
-
-app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.status(200).send(FRONTEND_HTML);
+</html>`);
 });
 
 app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+  res.status(404).json({
+    error: 'Route not found',
+    method: req.method,
+    path: req.originalUrl,
+    availableEndpoints: [
+      'GET /api/health',
+      'GET /api/academy/profile',
+      'GET /api/courses',
+      'GET /api/memory',
+      'GET /api/memory/export',
+      'POST /api/memory/import',
+    ],
+  });
 });
 
 app.use((err, req, res, next) => {
@@ -4603,7 +3324,7 @@ app.use((err, req, res, next) => {
 });
 
 // ============================================================================
-// 10. STARTUP & GRACEFUL SHUTDOWN (SUPPORTS --seed-bulk=N CLI FLAG)
+// 10. STARTUP & GRACEFUL SHUTDOWN
 // ============================================================================
 let serverInstance;
 
@@ -4637,6 +3358,14 @@ async function shutdown(signal) {
   await prisma.$disconnect();
   process.exit(0);
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
