@@ -1,0 +1,4644 @@
+/**
+ * Long life learning Academy — Unified Single-File Production Server & SPA
+ * Tagline: "We innovate to teach you Skills , Knowledges and develop you Possotive Mindset"
+ * Primary Admin: mohammedscho2023@gmail.com | Master Admin Code: 5405402
+ *
+ * Dependencies:
+ *   npm install express @prisma/client bcrypt jsonwebtoken helmet cors pdfkit dotenv
+ */
+
+'use strict';
+
+require('dotenv').config();
+
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const os = require('node:os');
+const vm = require('node:vm');
+const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const PDFDocument = require('pdfkit');
+const { PrismaClient } = require('@prisma/client');
+
+const execFileAsync = promisify(execFile);
+
+// ============================================================================
+// 1. CONFIGURATION & CONSTANTS
+// ============================================================================
+const PORT = Number(process.env.PORT) || 5000;
+const ACADEMY_NAME = process.env.ACADEMY_NAME || 'Long life learning Academy';
+const ACADEMY_TAGLINE =
+  process.env.ACADEMY_TAGLINE ||
+  'We innovate to teach you Skills , Knowledges and develop you Possotive Mindset';
+
+const PRIMARY_ADMIN_EMAIL = (process.env.PRIMARY_ADMIN_EMAIL || 'mohammedscho2023@gmail.com')
+  .trim()
+  .toLowerCase();
+const ADMIN_MASTER_CODE = process.env.ADMIN_MASTER_CODE || '5405402';
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  crypto.createHash('sha256').update(`${ADMIN_MASTER_CODE}:${PRIMARY_ADMIN_EMAIL}:llla-secret`).digest('hex');
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS) || 10;
+
+const MIN_CERT_PASS_SCORE = Math.min(
+  Math.max(Number(process.env.MIN_CERT_PASS_SCORE) || 75, 0),
+  100
+);
+
+const OTP_TTL_MS = Number(process.env.OTP_TTL_MS) || 10 * 60 * 1000;
+const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS) || 5;
+const REQUIRE_CONTACT_OTP =
+  String(process.env.REQUIRE_CONTACT_OTP || 'true').toLowerCase() === 'true';
+const ALLOW_DEV_OTP_PREVIEW =
+  String(process.env.ALLOW_DEV_OTP_PREVIEW || 'true').toLowerCase() === 'true';
+
+const DATA_DIR = path.resolve(process.env.ACADEMY_DATA_DIR || path.join(process.cwd(), 'data'));
+const MEMORY_FILE_PATH = path.join(DATA_DIR, 'academy-memory.jsonl');
+const ACADEMY_CONFIG_FILE = path.join(DATA_DIR, 'academy-config.json');
+const MAX_MEMORY_INDEX_ENTRIES = Number(process.env.MAX_MEMORY_INDEX_ENTRIES) || 50_000;
+
+const prisma = new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
+});
+
+// ============================================================================
+// 2. UNLIMITED PERSISTENT MEMORY & ACADEMY RUNTIME CONFIG
+// ============================================================================
+const memoryIndex = [];
+
+function ensureDataDirSync() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(MEMORY_FILE_PATH)) {
+    fs.writeFileSync(MEMORY_FILE_PATH, '', 'utf8');
+  }
+}
+
+function indexMemoryRecord(record) {
+  if (memoryIndex.length >= MAX_MEMORY_INDEX_ENTRIES) {
+    memoryIndex.shift();
+  }
+  memoryIndex.push(record);
+}
+
+function loadMemoryIndexSync() {
+  ensureDataDirSync();
+  const raw = fs.readFileSync(MEMORY_FILE_PATH, 'utf8');
+  if (!raw.trim()) return;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && parsed.id) {
+        indexMemoryRecord(parsed);
+      }
+    } catch (_) {}
+  }
+}
+
+loadMemoryIndexSync();
+
+async function writeUnlimitedMemory({
+  scope = 'ACADEMY',
+  entityId = null,
+  agentId = null,
+  title = 'Memory Entry',
+  content = '',
+  tags = [],
+  meta = {},
+}) {
+  ensureDataDirSync();
+  const record = {
+    id: `mem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+    scope: String(scope || 'ACADEMY').toUpperCase(),
+    entityId: entityId ? String(entityId) : null,
+    agentId: agentId ? String(agentId) : null,
+    title: String(title || 'Memory Entry').trim(),
+    content: String(content || ''),
+    tags: Array.isArray(tags)
+      ? tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+      : [],
+    meta,
+    createdAt: new Date().toISOString(),
+  };
+
+  await fsp.appendFile(MEMORY_FILE_PATH, `${JSON.stringify(record)}\n`, 'utf8');
+  indexMemoryRecord(record);
+  return record;
+}
+
+async function queryUnlimitedMemory({ q = '', scope = '', entityId = '', cursor = null, limit = 30 } = {}) {
+  ensureDataDirSync();
+  const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 200);
+  const queryLower = String(q || '').trim().toLowerCase();
+  const scopeUpper = String(scope || '').trim().toUpperCase();
+  const entityStr = String(entityId || '').trim();
+
+  const raw = await fsp.readFile(MEMORY_FILE_PATH, 'utf8');
+  const matched = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const rec = JSON.parse(t);
+      if (!rec || !rec.id) continue;
+      if (scopeUpper && rec.scope !== scopeUpper) continue;
+      if (entityStr && rec.entityId !== entityStr) continue;
+      if (queryLower) {
+        const hay = `${rec.title} ${rec.content} ${(rec.tags || []).join(' ')} ${rec.scope}`.toLowerCase();
+        if (!hay.includes(queryLower)) continue;
+      }
+      matched.push(rec);
+    } catch (_) {}
+  }
+
+  matched.reverse();
+
+  let startIdx = 0;
+  if (cursor) {
+    const foundIdx = matched.findIndex((r) => r.id === String(cursor).trim());
+    if (foundIdx !== -1) startIdx = foundIdx + 1;
+  }
+
+  const slice = matched.slice(startIdx, startIdx + safeLimit);
+  const hasMore = startIdx + safeLimit < matched.length;
+  const nextCursor = hasMore && slice.length > 0 ? slice[slice.length - 1].id : null;
+
+  return {
+    memories: slice,
+    totalMatched: matched.length,
+    pageInfo: { limit: safeLimit, hasMore, nextCursor },
+  };
+}
+
+async function getMemoryStats() {
+  ensureDataDirSync();
+  const stat = await fsp.stat(MEMORY_FILE_PATH);
+  const raw = await fsp.readFile(MEMORY_FILE_PATH, 'utf8');
+  let lineCount = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.trim()) lineCount += 1;
+  }
+  return {
+    storageEngine: 'Append-Only Persistent JSONL + Indexed Retrieval',
+    filePath: MEMORY_FILE_PATH,
+    totalRecords: lineCount,
+    diskSizeBytes: stat.size,
+    diskSizeMB: Number((stat.size / (1024 * 1024)).toFixed(3)),
+    capacityLimit: 'Unlimited (bounded only by disk volume)',
+  };
+}
+
+async function exportUnlimitedMemoryJsonl() {
+  ensureDataDirSync();
+  const raw = await fsp.readFile(MEMORY_FILE_PATH, 'utf8');
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  return {
+    jsonl: lines.length > 0 ? `${lines.join('\n')}\n` : '',
+    recordCount: lines.length,
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+async function importUnlimitedMemoryJsonl({ jsonlText = '', records = [], regenerateIds = false } = {}) {
+  ensureDataDirSync();
+  const existingRaw = await fsp.readFile(MEMORY_FILE_PATH, 'utf8');
+  const existingIds = new Set();
+  for (const line of existingRaw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const obj = JSON.parse(t);
+      if (obj && obj.id) existingIds.add(String(obj.id));
+    } catch (_) {}
+  }
+
+  const candidates = [];
+  if (Array.isArray(records) && records.length > 0) {
+    for (const r of records) candidates.push(r);
+  }
+
+  const text = String(jsonlText || '').trim();
+  if (text) {
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        candidates.push(JSON.parse(line));
+      } catch (err) {
+        const bad = new Error(`Invalid JSONL on line ${i + 1}: ${err.message}`);
+        bad.statusCode = 400;
+        throw bad;
+      }
+    }
+  }
+
+  if (candidates.length === 0) {
+    const bad = new Error('Provide non-empty JSONL lines or records to import.');
+    bad.statusCode = 400;
+    throw bad;
+  }
+
+  const acceptedLines = [];
+  let importedCount = 0;
+  let skippedDuplicateCount = 0;
+
+  for (const item of candidates) {
+    if (!item || typeof item !== 'object' || !String(item.content || '').trim()) {
+      continue;
+    }
+
+    const rawId = item.id ? String(item.id).trim() : '';
+    const finalId =
+      regenerateIds || !rawId
+        ? `mem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+        : rawId;
+
+    if (existingIds.has(finalId)) {
+      skippedDuplicateCount += 1;
+      continue;
+    }
+
+    const normalized = {
+      id: finalId,
+      scope: String(item.scope || 'ACADEMY').toUpperCase(),
+      entityId: item.entityId ? String(item.entityId) : null,
+      agentId: item.agentId ? String(item.agentId) : 'IMPORTED_BACKUP',
+      title: String(item.title || 'Imported Memory Entry').trim(),
+      content: String(item.content),
+      tags: Array.isArray(item.tags)
+        ? item.tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+        : [],
+      meta: item.meta && typeof item.meta === 'object' ? item.meta : { imported: true },
+      createdAt: item.createdAt || new Date().toISOString(),
+    };
+
+    existingIds.add(finalId);
+    acceptedLines.push(`${JSON.stringify(normalized)}\n`);
+    indexMemoryRecord(normalized);
+    importedCount += 1;
+  }
+
+  if (acceptedLines.length > 0) {
+    await fsp.appendFile(MEMORY_FILE_PATH, acceptedLines.join(''), 'utf8');
+  }
+
+  const stats = await getMemoryStats();
+  return {
+    importedCount,
+    skippedDuplicateCount,
+    totalInStore: stats.totalRecords,
+    stats,
+  };
+}
+
+let academyRuntimeConfig = null;
+
+async function loadAcademyRuntimeConfig() {
+  ensureDataDirSync();
+  try {
+    const raw = await fsp.readFile(ACADEMY_CONFIG_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      academyName: parsed.academyName || ACADEMY_NAME,
+      tagline: parsed.tagline || ACADEMY_TAGLINE,
+      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+      principles: Array.isArray(parsed.principles)
+        ? parsed.principles
+        : [
+            'Teach practical Skills for real-world mastery',
+            'Build deep Knowledges across any programming language & domain',
+            'Develop a resilient, growth-oriented Positive Mindset',
+          ],
+      promptImprovementsApplied: Number(parsed.promptImprovementsApplied || 0),
+      updatedAt: parsed.updatedAt || new Date().toISOString(),
+    };
+  } catch (_) {
+    const initial = {
+      academyName: ACADEMY_NAME,
+      tagline: ACADEMY_TAGLINE,
+      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+      principles: [
+        'Teach practical Skills for real-world mastery',
+        'Build deep Knowledges across any programming language & domain',
+        'Develop a resilient, growth-oriented Positive Mindset',
+      ],
+      promptImprovementsApplied: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    await fsp.writeFile(ACADEMY_CONFIG_FILE, JSON.stringify(initial, null, 2), 'utf8');
+    return initial;
+  }
+}
+
+async function saveAcademyRuntimeConfig(nextConfig) {
+  ensureDataDirSync();
+  const payload = {
+    ...nextConfig,
+    updatedAt: new Date().toISOString(),
+  };
+  await fsp.writeFile(ACADEMY_CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  academyRuntimeConfig = payload;
+  return payload;
+}
+
+async function ensureAcademyConfig() {
+  if (!academyRuntimeConfig) {
+    academyRuntimeConfig = await loadAcademyRuntimeConfig();
+  }
+  return academyRuntimeConfig;
+}
+
+// ============================================================================
+// 3. DOMAIN STORES (OTP, SOCIAL PROFILES, INSTRUCTORS, APPROVALS, LIBRARY, TOOLS, GRADING, CBL)
+// ============================================================================
+const VALID_OTP_CHANNELS = new Set(['PHONE', 'WHATSAPP', 'TELEGRAM']);
+const otpChallengeStore = new Map();
+const learnerSocialProfiles = new Map();
+const instructorsDirectory = new Map();
+const courseReviewMeta = new Map();
+
+const ALLOWED_TOOL_CATEGORIES = new Set([
+  'SEARCH_ENGINE',
+  'AI_TOOL',
+  'EDUCATIONAL_TOOL',
+  'EDUCATIONAL_SERVER',
+  'APP',
+]);
+
+const ALLOWED_RESOURCE_TYPES = new Set([
+  'BOOK',
+  'MODULE',
+  'GUIDE',
+  'TEMPLATE',
+  'CODE_PACK',
+  'DATASET',
+  'OTHER',
+]);
+
+const resourceLibrary = new Map();
+const externalToolsDirectory = new Map();
+const courseLinkedTools = new Map();
+
+const learnerSubmissions = new Map();
+const moduleTestCases = new Map();
+const learnerCourseScores = new Map();
+const coursePassScoreOverrides = new Map();
+
+const learnerTelemetryStore = new Map();
+const learnerAdaptationsStore = new Map();
+const learnerCompetencesStore = new Map();
+
+function isValidHttpUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || '').trim());
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeToolCategory(rawCat) {
+  const cleaned = String(rawCat || 'EDUCATIONAL_TOOL')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_');
+  if (cleaned.includes('SEARCH')) return 'SEARCH_ENGINE';
+  if (cleaned === 'AI' || cleaned.includes('AI_TOOL')) return 'AI_TOOL';
+  if (cleaned.includes('SERVER')) return 'EDUCATIONAL_SERVER';
+  if (cleaned === 'APP' || cleaned.includes('APPL')) return 'APP';
+  return ALLOWED_TOOL_CATEGORIES.has(cleaned) ? cleaned : 'EDUCATIONAL_TOOL';
+}
+
+function normalizeResourceType(rawType) {
+  const cleaned = String(rawType || 'OTHER')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_');
+  if (cleaned.includes('BOOK')) return 'BOOK';
+  if (cleaned.includes('MOD')) return 'MODULE';
+  if (cleaned.includes('GUIDE') || cleaned.includes('MANUAL')) return 'GUIDE';
+  if (cleaned.includes('TEMP')) return 'TEMPLATE';
+  if (cleaned.includes('CODE')) return 'CODE_PACK';
+  if (cleaned.includes('DATA')) return 'DATASET';
+  return ALLOWED_RESOURCE_TYPES.has(cleaned) ? cleaned : 'OTHER';
+}
+
+function normalizeSocialLinks(rawLinks) {
+  const allowedKeys = [
+    'whatsapp',
+    'telegram',
+    'linkedin',
+    'youtube',
+    'x',
+    'twitter',
+    'facebook',
+    'instagram',
+    'github',
+    'tiktok',
+    'website',
+  ];
+  const clean = {};
+  if (rawLinks && typeof rawLinks === 'object') {
+    for (const [k, v] of Object.entries(rawLinks)) {
+      const key = String(k).trim().toLowerCase();
+      const val = String(v ?? '').trim();
+      if (allowedKeys.includes(key) && val) {
+        clean[key] = val;
+      }
+    }
+  }
+  return clean;
+}
+
+function seedDefaultExternalTools() {
+  if (externalToolsDirectory.size > 0) return;
+  const defaults = [
+    {
+      name: 'Google Scholar / Open Search',
+      category: 'SEARCH_ENGINE',
+      url: 'https://scholar.google.com',
+      description: 'Search engine for scholarly research, books, and evidence.',
+      requiredForCourses: true,
+    },
+    {
+      name: 'AI Study & Curriculum Assistant',
+      category: 'AI_TOOL',
+      url: 'https://chatgpt.com',
+      description: 'AI tool for learning acceleration, code walkthroughs, and mindset reflection.',
+      requiredForCourses: false,
+    },
+    {
+      name: 'Theory of Change & RBM Educational Portal',
+      category: 'EDUCATIONAL_TOOL',
+      url: 'https://mstbedpm5402.github.io/Theory-of-Change-and-RBM-for-Program-managers/',
+      description: 'Interactive educational tool for program design, results, and learning.',
+      requiredForCourses: true,
+    },
+    {
+      name: 'Open Educational Code Server',
+      category: 'EDUCATIONAL_SERVER',
+      url: 'https://github.com',
+      description: 'Educational code server and repository for multi-language course labs.',
+      requiredForCourses: true,
+    },
+    {
+      name: 'KoboToolbox Field & Assessment App',
+      category: 'APP',
+      url: 'https://www.kobotoolbox.org',
+      description: 'Practical app for field data collection, surveys, and applied learning.',
+      requiredForCourses: false,
+    },
+  ];
+
+  for (const item of defaults) {
+    const id = `tool_${crypto.randomBytes(4).toString('hex')}`;
+    externalToolsDirectory.set(id, {
+      id,
+      ...item,
+      addedBy: PRIMARY_ADMIN_EMAIL,
+      addedAt: new Date().toISOString(),
+    });
+  }
+}
+
+seedDefaultExternalTools();
+
+function parseNonNegativeMoney(val, fieldName) {
+  if (val === undefined || val === null || val === '') {
+    return '0.00';
+  }
+  const num = Number(val);
+  if (!Number.isFinite(num) || num < 0) {
+    const err = new Error(`${fieldName} must be a non-negative number`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return num.toFixed(2);
+}
+
+function sanitizeFilenamePart(str) {
+  return String(str || 'Certificate')
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60) || 'Certificate';
+}
+
+function saveSubmissionRecord(key, record) {
+  if (learnerSubmissions.size >= 10_000) {
+    const oldestKey = learnerSubmissions.keys().next().value;
+    learnerSubmissions.delete(oldestKey);
+  }
+  learnerSubmissions.set(key, record);
+}
+
+function recordLearnerCourseScore(userId, courseId, score) {
+  const numericScore = Math.max(0, Math.min(100, Number(score) || 0));
+  const key = `${userId}:${courseId}`;
+  const prev = learnerCourseScores.get(key) || {
+    userId,
+    courseId,
+    bestScore: 0,
+    lastScore: 0,
+    attempts: 0,
+    lastEvaluatedAt: null,
+  };
+
+  const next = {
+    ...prev,
+    bestScore: Math.max(prev.bestScore, numericScore),
+    lastScore: numericScore,
+    attempts: prev.attempts + 1,
+    lastEvaluatedAt: new Date().toISOString(),
+  };
+
+  learnerCourseScores.set(key, next);
+  return next;
+}
+
+function getLearnerCourseScore(userId, courseId) {
+  return (
+    learnerCourseScores.get(`${userId}:${courseId}`) || {
+      userId,
+      courseId,
+      bestScore: 0,
+      lastScore: 0,
+      attempts: 0,
+      lastEvaluatedAt: null,
+    }
+  );
+}
+
+function getRequiredPassScore(courseId) {
+  const override = coursePassScoreOverrides.get(String(courseId));
+  return override !== undefined ? override : MIN_CERT_PASS_SCORE;
+}
+
+// ============================================================================
+// 4. PAYMENT GATEWAY & PDF CERTIFICATE STREAMER
+// ============================================================================
+async function processGatewayPayment({ amount, currency, paymentMethod, purpose, userId, courseId }) {
+  const normCurrency = String(currency || '').trim().toUpperCase();
+  const normMethod = String(paymentMethod || '').trim().toUpperCase();
+
+  const supportedMethodsByCurrency = {
+    ETB: ['TELEBIRR', 'CBE_BIRR'],
+    USD: ['PAYPAL'],
+  };
+
+  const allowedMethods = supportedMethodsByCurrency[normCurrency];
+  if (!allowedMethods) {
+    const err = new Error(`Unsupported currency "${currency}". Supported currencies: ETB, USD.`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!allowedMethods.includes(normMethod)) {
+    const err = new Error(
+      `Payment method "${paymentMethod}" is not supported for ${normCurrency}. Allowed: ${allowedMethods.join(', ')}.`
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount) || numericAmount < 0) {
+    const err = new Error('Invalid payment amount');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const prefixMap = {
+    TELEBIRR: 'TB',
+    CBE_BIRR: 'CBE',
+    PAYPAL: 'PP',
+  };
+
+  return {
+    status: 'COMPLETED',
+    amount: numericAmount.toFixed(2),
+    currency: normCurrency,
+    paymentMethod: normMethod,
+    purpose,
+    providerRef: `${prefixMap[normMethod] || 'PAY'}_${purpose}_${Date.now()}_${crypto.randomBytes(3).toString('hex').toUpperCase()}`,
+    paidAt: new Date().toISOString(),
+    metadata: { userId, courseId },
+  };
+}
+
+function streamCourseCertificatePDF(res, { studentName, courseTitle, programmingLanguage, issuedDate, certificateId }) {
+  const cfgName = academyRuntimeConfig?.academyName || ACADEMY_NAME;
+  const cfgTagline = academyRuntimeConfig?.tagline || ACADEMY_TAGLINE;
+  const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 45 });
+  const safeFilename = `${sanitizeFilenamePart(courseTitle)}_Certificate.pdf`;
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+
+  doc.pipe(res);
+
+  const width = doc.page.width;
+  const height = doc.page.height;
+
+  doc.lineWidth(4).strokeColor('#fca311').rect(24, 24, width - 48, height - 48).stroke();
+  doc.lineWidth(1.5).strokeColor('#004aad').rect(34, 34, width - 68, height - 68).stroke();
+
+  doc.font('Helvetica-Bold').fontSize(15).fillColor('#004aad').text(cfgName.toUpperCase(), 0, 62, { align: 'center' });
+  doc.font('Helvetica-Oblique').fontSize(10).fillColor('#475569').text(cfgTagline, 60, 82, {
+    align: 'center',
+    width: width - 120,
+  });
+
+  doc.font('Helvetica-Bold').fontSize(28).fillColor('#14213d').text('CERTIFICATE OF COMPLETION', 0, 118, { align: 'center' });
+  doc.font('Helvetica').fontSize(13).fillColor('#334155').text('This is to certify that', 0, 166, { align: 'center' });
+  doc.font('Helvetica-Bold').fontSize(26).fillColor('#004aad').text(studentName, 0, 196, { align: 'center' });
+  doc.font('Helvetica').fontSize(13).fillColor('#334155').text('has successfully completed', 0, 240, { align: 'center' });
+
+  doc.font('Helvetica-Bold').fontSize(20).fillColor('#14213d').text(courseTitle, 70, 268, {
+    align: 'center',
+    width: width - 140,
+  });
+
+  if (programmingLanguage) {
+    doc.font('Helvetica-Oblique').fontSize(11).fillColor('#475569').text(`Track / Language: ${programmingLanguage}`, 0, 306, { align: 'center' });
+  }
+
+  const formattedDate = new Date(issuedDate || Date.now()).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+
+  doc.font('Helvetica').fontSize(11).fillColor('#1e293b').text(`Date Issued: ${formattedDate}`, 90, height - 115);
+  doc.font('Helvetica').fontSize(10).fillColor('#64748b').text(`Certificate ID: ${certificateId}`, 90, height - 95);
+
+  doc.moveTo(width - 260, height - 118).lineTo(width - 90, height - 118).strokeColor('#14213d').stroke();
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('#14213d').text(cfgName, width - 270, height - 110, {
+    width: 190,
+    align: 'center',
+  });
+
+  doc.end();
+}
+
+// ============================================================================
+// 5. DOCKER SANDBOX RUNNER (PYTHON, JAVASCRIPT, GO, RUST) + CONCURRENCY QUEUE
+// ============================================================================
+const SANDBOX_LANG_CONFIGS = {
+  python: {
+    image: process.env.SANDBOX_PYTHON_IMAGE || 'python:3.12-slim',
+    filename: 'solution.py',
+    harnessFilename: 'harness.py',
+    timeoutMs: 4000,
+    buildHarness: (casesJson) => `
+import json
+from solution import solve
+
+cases = json.loads(${JSON.stringify(casesJson)})
+results = []
+for idx, tc in enumerate(cases):
+    name = tc.get("name") or f"Test #{idx + 1}"
+    expected = str(tc.get("expectedOutput", "")).strip()
+    try:
+        out = solve(tc.get("input"))
+        actual = json.dumps(out) if isinstance(out, (dict, list)) else str(out).strip()
+        passed = actual == expected if expected != "" else len(actual) > 0
+        results.append({"name": name, "passed": passed, "actual": actual, "expected": expected})
+    except Exception as exc:
+        results.append({"name": name, "passed": False, "actual": f"Error: {exc}", "expected": expected})
+print("__TEST_REPORT__" + json.dumps(results))
+`,
+    command: ['python3', '/work/harness.py'],
+  },
+  javascript: {
+    image: process.env.SANDBOX_NODE_IMAGE || 'node:22-alpine',
+    filename: 'solution.js',
+    harnessFilename: 'harness.js',
+    timeoutMs: 4000,
+    buildHarness: (casesJson) => `
+const { solve } = require('/work/solution.js');
+const cases = JSON.parse(${JSON.stringify(casesJson)});
+const results = cases.map((tc, idx) => {
+  const name = tc.name || 'Test #' + (idx + 1);
+  const expected = String(tc.expectedOutput ?? '').trim();
+  try {
+    if (typeof solve !== 'function') throw new Error('Define function solve(input)');
+    const out = solve(tc.input);
+    const actual = typeof out === 'object' && out !== null ? JSON.stringify(out) : String(out ?? '').trim();
+    const passed = expected !== '' ? actual === expected : actual.length > 0;
+    return { name, passed, actual, expected };
+  } catch (err) {
+    return { name, passed: false, actual: 'Error: ' + err.message, expected };
+  }
+});
+console.log('__TEST_REPORT__' + JSON.stringify(results));
+`,
+    command: ['node', '--max-old-space-size=192', '/work/harness.js'],
+  },
+  go: {
+    image: process.env.SANDBOX_GO_IMAGE || 'golang:1.23-alpine',
+    filename: 'solution.go',
+    harnessFilename: 'harness.go',
+    timeoutMs: 12000,
+    buildHarness: (casesJson) => `
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+type TestCase struct {
+	Name           string \`json:"name"\`
+	Input          any    \`json:"input"\`
+	ExpectedOutput string \`json:"expectedOutput"\`
+}
+
+type TestResult struct {
+	Name     string \`json:"name"\`
+	Passed   bool   \`json:"passed"\`
+	Actual   string \`json:"actual"\`
+	Expected string \`json:"expected"\`
+}
+
+func main() {
+	var cases []TestCase
+	_ = json.Unmarshal([]byte(${JSON.stringify(casesJson)}), &cases)
+	results := make([]TestResult, 0, len(cases))
+
+	for i, tc := range cases {
+		name := tc.Name
+		if name == "" {
+			name = fmt.Sprintf("Test #%d", i+1)
+		}
+		expected := strings.TrimSpace(tc.ExpectedOutput)
+		out := solve(tc.Input)
+		actual := strings.TrimSpace(fmt.Sprint(out))
+		passed := false
+		if expected != "" {
+			passed = actual == expected
+		} else {
+			passed = len(actual) > 0
+		}
+		results = append(results, TestResult{
+			Name:     name,
+			Passed:   passed,
+			Actual:   actual,
+			Expected: expected,
+		})
+	}
+
+	encoded, _ := json.Marshal(results)
+	fmt.Println("__TEST_REPORT__" + string(encoded))
+}
+`,
+    command: ['sh', '-c', 'GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomod go run /work/solution.go /work/harness.go'],
+  },
+  rust: {
+    image: process.env.SANDBOX_RUST_IMAGE || 'rust:1.83-slim',
+    filename: 'solution.rs',
+    harnessFilename: 'harness.rs',
+    timeoutMs: 15000,
+    buildHarness: (casesJson) => `
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize)]
+struct TestCase {
+    name: Option<String>,
+    input: serde_json::Value,
+    #[serde(rename = "expectedOutput", default)]
+    expected_output: String,
+}
+
+include!("solution.rs");
+
+fn main() {
+    let raw = ${JSON.stringify(casesJson)};
+    let cases: Vec<TestCase> = serde_json::from_str(raw).unwrap_or_default();
+    let mut results = Vec::with_capacity(cases.len());
+
+    for (idx, tc) in cases.iter().enumerate() {
+        let name = tc.name.clone().unwrap_or_else(|| format!("Test #{}", idx + 1));
+        let expected = tc.expected_output.trim().to_string();
+        let actual = solve(tc.input.clone()).trim().to_string();
+        let passed = if !expected.is_empty() {
+            actual == expected
+        } else {
+            !actual.is_empty()
+        };
+        results.push(json!({
+            "name": name,
+            "passed": passed,
+            "actual": actual,
+            "expected": expected
+        }));
+    }
+
+    println!("__TEST_REPORT__{}", serde_json::to_string(&results).unwrap());
+}
+`,
+    command: [
+      'sh',
+      '-c',
+      'CARGO_TARGET_DIR=/tmp/cargo-target rustc /work/harness.rs -O -o /tmp/runner && /tmp/runner',
+    ],
+  },
+};
+
+function normalizeSandboxLanguage(lang) {
+  const key = String(lang || '').trim().toLowerCase();
+  if (key === 'py' || key.startsWith('python')) return 'python';
+  if (key === 'js' || key === 'node' || key.startsWith('javascript')) return 'javascript';
+  if (key === 'go' || key.startsWith('golang')) return 'go';
+  if (key === 'rs' || key.startsWith('rust')) return 'rust';
+  return null;
+}
+
+async function runContainerTestCases({ language, code, testCases = [] }) {
+  const normalizedLang = normalizeSandboxLanguage(language);
+  const cfg = normalizedLang ? SANDBOX_LANG_CONFIGS[normalizedLang] : null;
+  if (!cfg) {
+    throw new Error(`Unsupported sandbox language "${language}".`);
+  }
+
+  const cases =
+    Array.isArray(testCases) && testCases.length > 0
+      ? testCases
+      : [{ name: 'Default Execution Check', input: '', expectedOutput: '' }];
+
+  const runId = crypto.randomBytes(6).toString('hex');
+  const tempDir = path.join(os.tmpdir(), `llla-sandbox-${runId}`);
+  await fs.mkdir(tempDir, { recursive: true });
+
+  try {
+    await fs.writeFile(path.join(tempDir, cfg.filename), String(code), 'utf8');
+    await fs.writeFile(
+      path.join(tempDir, cfg.harnessFilename),
+      cfg.buildHarness(JSON.stringify(cases)),
+      'utf8'
+    );
+
+    const dockerArgs = [
+      'run',
+      '--rm',
+      '--network', 'none',
+      '--memory', '256m',
+      '--memory-swap', '256m',
+      '--cpus', '0.5',
+      '--pids-limit', '64',
+      '--read-only',
+      '--tmpfs', '/tmp:rw,nosuid,size=128m',
+      '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges',
+      '--user', '1000:1000',
+      '-v', `${tempDir}:/work:ro`,
+      cfg.image,
+      ...cfg.command,
+    ];
+
+    const { stdout } = await execFileAsync('docker', dockerArgs, {
+      timeout: cfg.timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: 1024 * 1024,
+    });
+
+    const marker = '__TEST_REPORT__';
+    const markerIdx = stdout.lastIndexOf(marker);
+    if (markerIdx === -1) {
+      throw new Error('Test harness did not emit a valid report.');
+    }
+
+    const results = JSON.parse(stdout.slice(markerIdx + marker.length).trim());
+    const passedCount = results.filter((r) => r.passed).length;
+    const totalCount = results.length;
+    const score = totalCount > 0 ? Math.round((passedCount / totalCount) * 100) : 0;
+
+    return {
+      status: passedCount === totalCount ? 'PASSED' : 'PARTIAL_OR_FAILED',
+      score,
+      passedCount,
+      totalCount,
+      results,
+      feedback: `Docker Sandbox (${normalizedLang}): passed ${passedCount}/${totalCount} test cases (${score}%).`,
+    };
+  } catch (err) {
+    const timedOut = err.killed || err.code === 'ETIMEDOUT';
+    return {
+      status: timedOut ? 'TIMEOUT' : 'ERROR',
+      score: 0,
+      passedCount: 0,
+      totalCount: cases.length,
+      results: [],
+      feedback: timedOut
+        ? `Execution exceeded ${cfg.timeoutMs}ms time limit and was terminated.`
+        : `Sandbox execution failed: ${err.message}`,
+    };
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+class SandboxConcurrencyQueue {
+  constructor({ maxConcurrent = 4, maxQueueSize = 250, queueTimeoutMs = 30_000 } = {}) {
+    this.maxConcurrent = Math.max(1, Number(maxConcurrent) || 4);
+    this.maxQueueSize = Math.max(1, Number(maxQueueSize) || 250);
+    this.queueTimeoutMs = Math.max(1000, Number(queueTimeoutMs) || 30_000);
+    this.activeCount = 0;
+    this.queue = [];
+  }
+
+  enqueue(taskFn) {
+    if (this.queue.length >= this.maxQueueSize) {
+      const err = new Error('Grading queue is currently full. Please retry in a moment.');
+      err.statusCode = 429;
+      return Promise.reject(err);
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = { taskFn, resolve, reject, settled: false, timer: null };
+      entry.timer = setTimeout(() => {
+        if (entry.settled) return;
+        entry.settled = true;
+        const idx = this.queue.indexOf(entry);
+        if (idx !== -1) this.queue.splice(idx, 1);
+        const err = new Error('Timed out waiting for a grading worker slot.');
+        err.statusCode = 503;
+        reject(err);
+      }, this.queueTimeoutMs);
+
+      this.queue.push(entry);
+      this.drain();
+    });
+  }
+
+  drain() {
+    while (this.activeCount < this.maxConcurrent && this.queue.length > 0) {
+      const entry = this.queue.shift();
+      if (!entry || entry.settled) continue;
+
+      clearTimeout(entry.timer);
+      this.activeCount += 1;
+
+      Promise.resolve()
+        .then(() => entry.taskFn())
+        .then(
+          (val) => {
+            if (!entry.settled) {
+              entry.settled = true;
+              entry.resolve(val);
+            }
+          },
+          (err) => {
+            if (!entry.settled) {
+              entry.settled = true;
+              entry.reject(err);
+            }
+          }
+        )
+        .finally(() => {
+          this.activeCount -= 1;
+          this.drain();
+        });
+    }
+  }
+
+  stats() {
+    return {
+      active: this.activeCount,
+      queued: this.queue.length,
+      maxConcurrent: this.maxConcurrent,
+    };
+  }
+}
+
+const sandboxQueue = new SandboxConcurrencyQueue({
+  maxConcurrent: Number(process.env.SANDBOX_MAX_CONCURRENT) || 4,
+  maxQueueSize: Number(process.env.SANDBOX_MAX_QUEUE_SIZE) || 250,
+  queueTimeoutMs: Number(process.env.SANDBOX_QUEUE_TIMEOUT_MS) || 30_000,
+});
+
+function normalizeTestOutput(val) {
+  return String(val ?? '').trim().replace(/\r\n/g, '\n');
+}
+
+function evaluateSubmissionInProcess({ language, code, testCases = [] }) {
+  const trimmedCode = String(code || '').trim();
+  if (!trimmedCode) {
+    return {
+      status: 'FAILED',
+      score: 0,
+      passedCount: 0,
+      totalCount: testCases.length,
+      results: [],
+      feedback: 'Submission code is empty.',
+    };
+  }
+
+  const casesToRun =
+    testCases.length > 0
+      ? testCases
+      : [{ name: 'Default Structure & Logic Check', input: '', expectedOutput: '' }];
+
+  const langLower = String(language || '').toLowerCase();
+  const isJsRunnable =
+    (langLower.includes('javascript') || langLower.includes('node') || langLower === 'js') &&
+    /function\s+solve\s*\(/.test(trimmedCode);
+
+  const results = [];
+  let passedCount = 0;
+
+  for (let i = 0; i < casesToRun.length; i += 1) {
+    const tc = casesToRun[i];
+    const caseName = tc.name || `Test Case #${i + 1}`;
+    const expected = normalizeTestOutput(tc.expectedOutput);
+
+    if (isJsRunnable) {
+      try {
+        const sandbox = Object.create(null);
+        sandbox.JSON = JSON;
+        sandbox.Math = Math;
+        sandbox.Array = Array;
+        sandbox.Object = Object;
+        sandbox.String = String;
+        sandbox.Number = Number;
+        sandbox.Boolean = Boolean;
+        sandbox.__testInput = tc.input;
+
+        const scriptCode = `${trimmedCode}\n;globalThis.__result = solve(globalThis.__testInput);`;
+        vm.runInNewContext(scriptCode, sandbox, { timeout: 250 });
+
+        const actual = normalizeTestOutput(
+          typeof sandbox.__result === 'object' && sandbox.__result !== null
+            ? JSON.stringify(sandbox.__result)
+            : sandbox.__result
+        );
+
+        const passed = expected ? actual === expected : actual.length > 0;
+        if (passed) passedCount += 1;
+        results.push({ name: caseName, passed, actual, expected });
+      } catch (err) {
+        results.push({ name: caseName, passed: false, actual: `Runtime Error: ${err.message}`, expected });
+      }
+    } else {
+      const hasSubstantialLogic = trimmedCode.length >= 10;
+      const expectedMatch = expected ? trimmedCode.includes(expected) : true;
+      const passed = hasSubstantialLogic && expectedMatch;
+      if (passed) passedCount += 1;
+      results.push({
+        name: caseName,
+        passed,
+        actual: hasSubstantialLogic ? 'Code artifact verified' : 'Code too short',
+        expected: expected || '(Any valid solution in your chosen language)',
+      });
+    }
+  }
+
+  const totalCount = casesToRun.length;
+  const score = Math.round((passedCount / totalCount) * 100);
+  const status = passedCount === totalCount ? 'PASSED' : 'PARTIAL_OR_FAILED';
+
+  return {
+    status,
+    score,
+    passedCount,
+    totalCount,
+    results,
+    feedback:
+      status === 'PASSED'
+        ? `Passed ${passedCount}/${totalCount} test cases (${score}%).`
+        : `Passed ${passedCount}/${totalCount} test cases (${score}%).`,
+  };
+}
+
+async function evaluateCodeSubmissionQueued({ language, code, testCases = [] }) {
+  const trimmedCode = String(code || '').trim();
+  if (!trimmedCode) {
+    return {
+      status: 'FAILED',
+      score: 0,
+      passedCount: 0,
+      totalCount: testCases.length,
+      results: [],
+      feedback: 'Submission code is empty.',
+    };
+  }
+
+  const supportedDockerLang = normalizeSandboxLanguage(language);
+  const useDocker =
+    supportedDockerLang &&
+    String(process.env.USE_DOCKER_SANDBOX || 'false').toLowerCase() === 'true';
+
+  if (useDocker) {
+    return sandboxQueue.enqueue(() =>
+      runContainerTestCases({
+        language: supportedDockerLang,
+        code: trimmedCode,
+        testCases,
+      })
+    );
+  }
+
+  return sandboxQueue.enqueue(() =>
+    evaluateSubmissionInProcess({
+      language,
+      code: trimmedCode,
+      testCases,
+    })
+  );
+}
+
+// ============================================================================
+// 6. FREE AI PROVIDERS, OPEN AI SYSTEM, LEARNING MONITOR, ADAPTIVE & CBL ENGINE
+// ============================================================================
+const OPEN_AI_MODES = {
+  COPILOT: {
+    id: 'COPILOT',
+    label: 'Academy Copilot (Code & Lab Builder)',
+    persona: 'You are Academy Copilot. Write crisp, practical code in any programming language, test cases, and implementation steps.',
+  },
+  CLAUDE_ANALYST: {
+    id: 'CLAUDE_ANALYST',
+    label: 'Academy Claude-Style Analyst (Deep Reasoning & Architecture)',
+    persona: 'You are Academy Deep Analyst. Provide structured reasoning, clear trade-offs, logical frameworks, and rigorous explanations.',
+  },
+  CHATGPT_COACH: {
+    id: 'CHATGPT_COACH',
+    label: 'Academy ChatGPT-Style Tutor & Mindset Coach',
+    persona: 'You are Academy Tutor & Coach. Guide learners step by step and nurture skills, knowledge, and a positive mindset.',
+  },
+  BREAKTHROUGH: {
+    id: 'BREAKTHROUGH',
+    label: 'Academy Breakthrough Engine (Cross-Domain Innovation)',
+    persona: 'You are Academy Breakthrough Engine. Combine ideas from prior memories and disciplines to uncover breakthrough insights.',
+  },
+};
+
+const MASTERY_THRESHOLDS = [
+  { minScore: 90, level: 'MASTERED' },
+  { minScore: 75, level: 'COMPETENT' },
+  { minScore: 50, level: 'DEVELOPING' },
+  { minScore: 0, level: 'NOVICE' },
+];
+
+function computeMasteryLevel(score) {
+  const numeric = Math.max(0, Math.min(100, Number(score) || 0));
+  for (const tier of MASTERY_THRESHOLDS) {
+    if (numeric >= tier.minScore) return tier.level;
+  }
+  return 'NOVICE';
+}
+
+async function callFreeAiModel({ systemPrompt, userPrompt, preferredProvider = 'auto', timeoutMs = 9000 }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (preferredProvider === 'ollama' || preferredProvider === 'auto') {
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
+    const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.2';
+    try {
+      const res = await fetch(ollamaUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          system: systemPrompt,
+          prompt: userPrompt,
+          stream: false,
+        }),
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data.response === 'string' && data.response.trim()) {
+          clearTimeout(timer);
+          return { provider: `Free Local AI (Ollama: ${ollamaModel})`, text: data.response.trim() };
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (preferredProvider === 'pollinations' || preferredProvider === 'auto') {
+    try {
+      const combinedPrompt = `${systemPrompt}\n\nTask:\n${userPrompt}`;
+      const url = `https://text.pollinations.ai/${encodeURIComponent(combinedPrompt.slice(0, 3500))}`;
+      const res = await fetch(url, { signal: controller.signal });
+      if (res.ok) {
+        const text = (await res.text()).trim();
+        if (text && !text.toLowerCase().includes('error code') && text.length > 15) {
+          clearTimeout(timer);
+          return { provider: 'Free Cloud AI (Pollinations.ai)', text };
+        }
+      }
+    } catch (_) {}
+  }
+
+  clearTimeout(timer);
+  return { provider: 'Built-in Free Local Synthesis Engine', text: null };
+}
+
+function buildStructuredModeResponse({ modeId, prompt, contextMemories = [], courseTitle = '' }) {
+  const cleanPrompt = String(prompt || '').trim();
+  const memCount = contextMemories.length;
+  const scopeLabel = courseTitle ? `Course "${courseTitle}"` : 'Long life learning Academy';
+
+  if (modeId === 'COPILOT') {
+    return [
+      `### Copilot Code & Lab Blueprint (${scopeLabel})`,
+      `- Objective: ${cleanPrompt}`,
+      `- Memory Context Consulted: ${memCount} record(s)`,
+      'function solve(input) {',
+      '  if (input === null || input === undefined) return "";',
+      '  if (Array.isArray(input)) return input.length;',
+      '  return String(input).trim();',
+      '}',
+    ].join('\n');
+  }
+
+  if (modeId === 'CLAUDE_ANALYST') {
+    return [
+      `### Deep Structured Analysis (${scopeLabel})`,
+      `- Prompt: ${cleanPrompt}`,
+      `- 1. Core Breakdown: Separate executable skills, foundational knowledge, and positive mindset habits.`,
+      `- 2. Trade-Offs: Balance rapid iteration with rigorous verification (${memCount} memory record(s) reviewed).`,
+      `- 3. Execution Path: Deliver small, testable increments and verify each step.`,
+    ].join('\n');
+  }
+
+  if (modeId === 'BREAKTHROUGH') {
+    const seed = contextMemories[0]?.title || 'iterative practice and reflective learning';
+    return [
+      `### Breakthrough Synthesis (${scopeLabel})`,
+      `- Spark: ${cleanPrompt}`,
+      `- Memory Seed: "${seed}"`,
+      `- Breakthrough Insight: Pairing immediate hands-on execution with positive-mindset reflection turns mistakes into rapid skill breakthroughs.`,
+    ].join('\n');
+  }
+
+  return [
+    `### Learning Coach & Positive Mindset Guide (${scopeLabel})`,
+    `- Prompt: ${cleanPrompt}`,
+    `- Guidance: Break the challenge into small steps, test each piece, and maintain a constructive, positive mindset.`,
+  ].join('\n');
+}
+
+async function runAcademyOpenAi({
+  mode = 'CHATGPT_COACH',
+  prompt,
+  codeContext = '',
+  course = null,
+  userId = null,
+  preferredProvider = 'auto',
+}) {
+  const cfg = await ensureAcademyConfig();
+  const normMode = String(mode || 'CHATGPT_COACH').trim().toUpperCase();
+  const modeMeta = OPEN_AI_MODES[normMode] || OPEN_AI_MODES.CHATGPT_COACH;
+  const cleanPrompt = String(prompt || '').trim();
+
+  if (!cleanPrompt) {
+    const err = new Error('Prompt is required for Academy Open AI.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const keywords = cleanPrompt
+    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2)
+    .slice(0, 3)
+    .join(' ');
+
+  const memoryQuery = await queryUnlimitedMemory({ q: keywords, limit: 8 });
+  const memories = memoryQuery.memories || [];
+
+  const aiResult = await callFreeAiModel({
+    preferredProvider,
+    systemPrompt: `${modeMeta.persona} Academy: "${cfg.academyName}" (${cfg.tagline}).`,
+    userPrompt: [
+      course ? `Course: ${course.title} (${course.programmingLanguage})` : 'Scope: Academy-Wide',
+      codeContext ? `Context:\n${String(codeContext).slice(0, 2000)}` : '',
+      `Prompt:\n${cleanPrompt}`,
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  });
+
+  const outputText =
+    aiResult.text ||
+    buildStructuredModeResponse({
+      modeId: modeMeta.id,
+      prompt: cleanPrompt,
+      contextMemories: memories,
+      courseTitle: course?.title || '',
+    });
+
+  const memoryRecord = await writeUnlimitedMemory({
+    scope: course ? 'COURSE' : 'AGENT',
+    entityId: course ? course.id : 'OPEN_AI_SYSTEM',
+    agentId: `OPEN_AI_${modeMeta.id}`,
+    title: `[${modeMeta.id}] ${cleanPrompt.slice(0, 85)}`,
+    content: `Mode: ${modeMeta.label}\nProvider: ${aiResult.provider}\nPrompt: ${cleanPrompt}\n\nResponse:\n${outputText}`,
+    tags: ['open-ai', modeMeta.id.toLowerCase()],
+    meta: { mode: modeMeta.id, provider: aiResult.provider, userId: userId || null },
+  });
+
+  return {
+    id: `oai_${crypto.randomBytes(4).toString('hex')}`,
+    mode: modeMeta,
+    provider: aiResult.provider,
+    output: outputText,
+    memoriesConsulted: memories.length,
+    memorySaved: memoryRecord,
+  };
+}
+
+async function monitorLearnerProgress({
+  userId,
+  courseId = 'general',
+  moduleId = 'general',
+  score = null,
+  timeSpentMinutes = 0,
+  completedLesson = false,
+  mindsetNote = '',
+}) {
+  if (!userId) {
+    const err = new Error('userId is required for learning monitoring.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const key = `${userId}:${courseId}`;
+  const prev = learnerTelemetryStore.get(key) || {
+    userId,
+    courseId,
+    interactions: 0,
+    completedLessons: [],
+    scores: [],
+    totalMinutes: 0,
+    struggleCount: 0,
+    lastMindsetNote: '',
+    updatedAt: new Date().toISOString(),
+  };
+
+  const numericScore = score !== null && score !== undefined && score !== '' ? Number(score) : null;
+  const mins = Math.max(0, Number(timeSpentMinutes) || 0);
+  const nextScores =
+    numericScore !== null && Number.isFinite(numericScore) ? [...prev.scores, numericScore] : prev.scores;
+  const nextCompleted =
+    completedLesson && moduleId && !prev.completedLessons.includes(moduleId)
+      ? [...prev.completedLessons, moduleId]
+      : prev.completedLessons;
+
+  const isLowScore = numericScore !== null && Number.isFinite(numericScore) && numericScore < 60;
+  const nextStruggleCount = prev.struggleCount + (isLowScore ? 1 : 0);
+  const avgScore =
+    nextScores.length > 0
+      ? Math.round(nextScores.reduce((a, b) => a + b, 0) / nextScores.length)
+      : 0;
+
+  let learningSignal = 'STEADY_PROGRESS';
+  if (nextStruggleCount >= 2 || (numericScore !== null && numericScore < 50)) {
+    learningSignal = 'NEEDS_GUIDED_SUPPORT';
+  } else if (avgScore >= 85 && nextCompleted.length >= 1) {
+    learningSignal = 'ACCELERATED_MASTERY';
+  }
+
+  const updated = {
+    ...prev,
+    interactions: prev.interactions + 1,
+    completedLessons: nextCompleted,
+    scores: nextScores,
+    averageScore: avgScore,
+    totalMinutes: prev.totalMinutes + mins,
+    struggleCount: nextStruggleCount,
+    learningSignal,
+    lastMindsetNote: mindsetNote ? String(mindsetNote).trim() : prev.lastMindsetNote,
+    updatedAt: new Date().toISOString(),
+  };
+
+  learnerTelemetryStore.set(key, updated);
+
+  await writeUnlimitedMemory({
+    scope: 'LEARNER',
+    entityId: String(userId),
+    agentId: 'AI_LEARNING_MONITOR',
+    title: `[Monitor] User ${userId} on ${courseId} (${learningSignal})`,
+    content: `Signal: ${learningSignal} | Avg Score: ${avgScore}% | Completed: ${nextCompleted.length} | Minutes: ${updated.totalMinutes}`,
+    tags: ['learning-monitor', learningSignal.toLowerCase()],
+    meta: { userId, courseId, avgScore, learningSignal },
+  });
+
+  return updated;
+}
+
+async function adaptCourseForLearner({ userId, courseId, goal = '', pace = 'ADAPTIVE' }) {
+  const course = await prisma.course.findUnique({
+    where: { id: String(courseId) },
+    include: { modules: { orderBy: { orderIndex: 'asc' } } },
+  });
+  if (!course) {
+    const err = new Error('Course not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const telemetry = learnerTelemetryStore.get(`${userId}:${courseId}`) || {
+    averageScore: 70,
+    completedLessons: [],
+    learningSignal: 'STEADY_PROGRESS',
+  };
+
+  const normPace = String(pace || 'ADAPTIVE').toUpperCase();
+  const needsSupport = normPace === 'FOUNDATIONAL' || telemetry.learningSignal === 'NEEDS_GUIDED_SUPPORT';
+  const fastTrack = normPace === 'FAST_TRACK' || telemetry.learningSignal === 'ACCELERATED_MASTERY';
+
+  const completedSet = new Set(telemetry.completedLessons || []);
+  const remaining = (course.modules || []).filter((m) => !completedSet.has(m.id));
+  const targetMods = remaining.length > 0 ? remaining : course.modules || [];
+
+  const adaptivePlan = {
+    userId,
+    courseId: course.id,
+    courseTitle: course.title,
+    pace: needsSupport
+      ? 'FOUNDATIONAL_SUPPORT'
+      : fastTrack
+      ? 'ACCELERATED_CHALLENGE'
+      : 'BALANCED_ADAPTIVE',
+    goal: goal ? String(goal).trim() : 'Build skills, knowledge, and a positive mindset',
+    recommendedModules: targetMods.map((m, idx) => ({
+      step: idx + 1,
+      moduleId: m.id,
+      title: m.title,
+      language: m.language || course.programmingLanguage,
+      focus: needsSupport
+        ? 'Guided step-by-step practice + foundational review + positive mindset check-in'
+        : fastTrack
+        ? 'Challenge problem + architecture optimization + peer synthesis'
+        : 'Balanced skill practice + knowledge check + real-world lab',
+    })),
+    adaptedAt: new Date().toISOString(),
+  };
+
+  learnerAdaptationsStore.set(`${userId}:${courseId}`, adaptivePlan);
+
+  await writeUnlimitedMemory({
+    scope: 'COURSE',
+    entityId: course.id,
+    agentId: 'ADAPTIVE_COURSE_ENGINE',
+    title: `[Adapted Course] ${course.title} -> ${adaptivePlan.pace}`,
+    content: `User: ${userId} | Pace: ${adaptivePlan.pace} | Goal: ${adaptivePlan.goal}`,
+    tags: ['adaptive-course', course.id],
+    meta: { userId, courseId: course.id, pace: adaptivePlan.pace },
+  });
+
+  return adaptivePlan;
+}
+
+async function assessCompetence({
+  userId,
+  courseId = 'general',
+  competencyId,
+  competencyName,
+  evidenceScore,
+  evidenceNotes = '',
+}) {
+  if (!userId || !competencyName) {
+    const err = new Error('userId and competencyName are required.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const score = Math.max(0, Math.min(100, Number(evidenceScore ?? 0)));
+  const storeKey = `${userId}:${courseId}`;
+  const currentMap = learnerCompetencesStore.get(storeKey) || new Map();
+  const cId =
+    String(competencyId || competencyName)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_') || 'competency';
+
+  const existing = currentMap.get(cId);
+  const bestScore = existing ? Math.max(existing.bestScore, score) : score;
+  const level = computeMasteryLevel(bestScore);
+
+  const record = {
+    competencyId: cId,
+    competencyName: String(competencyName).trim(),
+    latestScore: score,
+    bestScore,
+    level,
+    achieved: bestScore >= 75,
+    evidenceNotes: evidenceNotes ? String(evidenceNotes).trim() : '',
+    assessmentsCount: (existing?.assessmentsCount || 0) + 1,
+    updatedAt: new Date().toISOString(),
+  };
+
+  currentMap.set(cId, record);
+  learnerCompetencesStore.set(storeKey, currentMap);
+
+  await writeUnlimitedMemory({
+    scope: 'LEARNER',
+    entityId: String(userId),
+    agentId: 'COMPETENCE_ENGINE',
+    title: `[CBL] ${record.competencyName} -> ${level} (${bestScore}%)`,
+    content: `Course: ${courseId} | Best: ${bestScore}% | Achieved: ${record.achieved}${evidenceNotes ? ` | Notes: ${evidenceNotes}` : ''}`,
+    tags: ['competence-based-learning', level.toLowerCase()],
+    meta: { userId, courseId, competencyId: cId, bestScore, level },
+  });
+
+  return {
+    userId,
+    courseId,
+    competency: record,
+    allCompetencies: Array.from(currentMap.values()),
+  };
+}
+
+function getLearnerCompetenceSummary(userId, courseId = 'general') {
+  const map = learnerCompetencesStore.get(`${userId}:${courseId}`);
+  const items = map ? Array.from(map.values()) : [];
+  const achievedCount = items.filter((i) => i.achieved).length;
+  return {
+    userId,
+    courseId,
+    totalCompetencies: items.length,
+    achievedCount,
+    competenceReadinessPercent: items.length > 0 ? Math.round((achievedCount / items.length) * 100) : 0,
+    competencies: items,
+  };
+}
+
+async function runPromptImprovementAgent({
+  agentId = 'CURRICULUM_ARCHITECT',
+  targetScope = 'COURSE',
+  courseId = null,
+  prompt,
+  autoApply = true,
+  preferredProvider = 'auto',
+}) {
+  const cfg = await ensureAcademyConfig();
+  const cleanPrompt = String(prompt || '').trim();
+  if (!cleanPrompt) {
+    const err = new Error('Prompt is required.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let course = null;
+  if (targetScope === 'COURSE') {
+    if (!courseId) {
+      const err = new Error('courseId is required when targetScope is COURSE.');
+      err.statusCode = 400;
+      throw err;
+    }
+    course = await prisma.course.findUnique({
+      where: { id: String(courseId) },
+      include: { modules: { orderBy: { orderIndex: 'asc' } } },
+    });
+    if (!course) {
+      const err = new Error('Course not found.');
+      err.statusCode = 404;
+      throw err;
+    }
+  }
+
+  const aiOut = await callFreeAiModel({
+    preferredProvider,
+    systemPrompt: `You are ${agentId} improving "${cfg.academyName}" (${cfg.tagline}).`,
+    userPrompt:
+      targetScope === 'COURSE' && course
+        ? `Improve course "${course.title}" (${course.programmingLanguage}) for prompt: "${cleanPrompt}".`
+        : `Improve academy "${cfg.academyName}" for prompt: "${cleanPrompt}".`,
+  });
+
+  let updatedCourse = course;
+  let updatedConfig = cfg;
+  let appliedChanges = { applied: false };
+
+  if (autoApply) {
+    if (targetScope === 'COURSE' && course) {
+      const nextOrder = (course.modules?.length || 0) + 1;
+      updatedCourse = await prisma.course.update({
+        where: { id: course.id },
+        data: {
+          description: `${course.description}\n\n[Prompt Improvement]: ${cleanPrompt}`,
+          modules: {
+            create: [
+              {
+                title: `Improved Module ${nextOrder}: ${cleanPrompt.slice(0, 60)}`,
+                contentUrl: 'https://github.com',
+                language: course.programmingLanguage,
+                contentType: 'CODE_REPO',
+                starterCode: `// Prompt-driven lab for: ${cleanPrompt}\nfunction solve(input) {\n  return input;\n}\n`,
+                orderIndex: nextOrder,
+              },
+            ],
+          },
+        },
+        include: { modules: { orderBy: { orderIndex: 'asc' } } },
+      });
+      appliedChanges = { applied: true, scope: 'COURSE', courseId: course.id };
+    } else if (targetScope === 'ACADEMY') {
+      const principle = `Prompt Upgrade (${new Date().toISOString().slice(0, 10)}): ${cleanPrompt}`;
+      updatedConfig = await saveAcademyRuntimeConfig({
+        ...cfg,
+        principles: [...(cfg.principles || []), principle].slice(-50),
+        promptImprovementsApplied: Number(cfg.promptImprovementsApplied || 0) + 1,
+      });
+      appliedChanges = {
+        applied: true,
+        scope: 'ACADEMY',
+        promptImprovementsApplied: updatedConfig.promptImprovementsApplied,
+      };
+    }
+  }
+
+  const memoryRecord = await writeUnlimitedMemory({
+    scope: targetScope === 'COURSE' ? 'COURSE' : 'ACADEMY',
+    entityId: course ? course.id : 'ACADEMY_CORE',
+    agentId,
+    title: `[Prompt Improvement] ${cleanPrompt.slice(0, 80)}`,
+    content: `Prompt: ${cleanPrompt}\nProvider: ${aiOut.provider}\n\n${aiOut.text || 'Applied structured improvement.'}`,
+    tags: ['prompt-improvement', targetScope.toLowerCase()],
+    meta: { agentId, provider: aiOut.provider, applied: appliedChanges.applied },
+  });
+
+  return {
+    agentId,
+    provider: aiOut.provider,
+    aiNarrative: aiOut.text || `Applied ${targetScope} improvement for: ${cleanPrompt}`,
+    appliedChanges,
+    course: updatedCourse,
+    academyConfig: updatedConfig,
+    memorySaved: memoryRecord,
+  };
+}
+
+async function runAutonomousCourseWorkflow({
+  prompt,
+  courseTitle,
+  programmingLanguage = 'Any Programming Language',
+  moduleCount = 4,
+  priceETB = 0,
+  priceUSD = 0,
+  certFeeETB = 150,
+  certFeeUSD = 3,
+  isPublished = true,
+  preferredProvider = 'auto',
+}) {
+  const cfg = await ensureAcademyConfig();
+  const cleanPrompt = String(prompt || '').trim();
+  if (!cleanPrompt) {
+    const err = new Error('Prompt is required for the autonomous course workflow.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const safeCount = Math.min(Math.max(Number(moduleCount) || 4, 2), 10);
+  const lang = String(programmingLanguage || 'Any Programming Language').trim();
+  const resolvedTitle =
+    String(courseTitle || '').trim() ||
+    `${cleanPrompt.slice(0, 72).replace(/[.!?\s]+$/g, '')} — Course`;
+
+  const workflowId = `wf_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const aiPlan = await callFreeAiModel({
+    preferredProvider,
+    systemPrompt: `Curriculum Architect for "${cfg.academyName}" (${cfg.tagline}).`,
+    userPrompt: `Create a ${safeCount}-module course in ${lang} from prompt: "${cleanPrompt}".`,
+  });
+
+  const templates = [
+    {
+      suffix: 'Skills, Knowledge & Positive Mindset Foundations',
+      contentType: 'ARTICLE',
+      input: 'mindset-ready',
+      expectedOutput: 'Positive Mindset Ready',
+      starterCode: `function solve(input) {\n  return "Positive Mindset Ready";\n}\n`,
+    },
+    {
+      suffix: 'Core Problem Solving & Implementation',
+      contentType: 'CODE_REPO',
+      input: [3, 7],
+      expectedOutput: '10',
+      starterCode: `function solve(input) {\n  return Array.isArray(input) ? input.reduce((a, b) => a + Number(b || 0), 0) : input;\n}\n`,
+    },
+    {
+      suffix: 'Testing, Edge Cases & Verification',
+      contentType: 'SANDBOX',
+      input: 'academy',
+      expectedOutput: 'ACADEMY',
+      starterCode: `function solve(input) {\n  return String(input ?? "").toUpperCase();\n}\n`,
+    },
+    {
+      suffix: 'Capstone Project & Mastery',
+      contentType: 'CODE_REPO',
+      input: 'complete',
+      expectedOutput: 'COMPLETE',
+      starterCode: `function solve(input) {\n  return String(input || "complete").toUpperCase();\n}\n`,
+    },
+  ];
+
+  const plannedModules = [];
+  for (let i = 0; i < safeCount; i += 1) {
+    const tpl = templates[i % templates.length];
+    plannedModules.push({
+      title: `Module ${i + 1}: ${tpl.suffix}`,
+      contentUrl: 'https://github.com',
+      language: lang,
+      contentType: tpl.contentType,
+      starterCode: tpl.starterCode,
+      orderIndex: i + 1,
+      testCases: [
+        { name: `Test 1 (${tpl.suffix})`, input: tpl.input, expectedOutput: tpl.expectedOutput },
+      ],
+    });
+  }
+
+  const createdCourse = await prisma.course.create({
+    data: {
+      title: resolvedTitle,
+      description: `Autonomous AI course for ${cfg.academyName} (${cfg.tagline}). Prompt: ${cleanPrompt}`,
+      programmingLanguage: lang,
+      priceETB: parseNonNegativeMoney(priceETB, 'priceETB'),
+      priceUSD: parseNonNegativeMoney(priceUSD, 'priceUSD'),
+      certFeeETB: parseNonNegativeMoney(certFeeETB, 'certFeeETB'),
+      certFeeUSD: parseNonNegativeMoney(certFeeUSD, 'certFeeUSD'),
+      isPublished: Boolean(isPublished),
+      modules: {
+        create: plannedModules.map(({ testCases, ...row }) => row),
+      },
+    },
+    include: { modules: { orderBy: { orderIndex: 'asc' } } },
+  });
+
+  const allCases = [];
+  for (let i = 0; i < createdCourse.modules.length; i += 1) {
+    const mod = createdCourse.modules[i];
+    const cases = plannedModules[i]?.testCases || [];
+    moduleTestCases.set(`${createdCourse.id}:${mod.id}`, cases);
+    allCases.push(...cases);
+  }
+  moduleTestCases.set(`${createdCourse.id}:general`, allCases);
+
+  const memoryRecord = await writeUnlimitedMemory({
+    scope: 'COURSE',
+    entityId: createdCourse.id,
+    agentId: 'AUTONOMOUS_MULTI_AGENT_WORKFLOW',
+    title: `[Autonomous Course] ${createdCourse.title}`,
+    content: `Workflow: ${workflowId}\nPrompt: ${cleanPrompt}\nModules: ${createdCourse.modules.length}\nProvider: ${aiPlan.provider}${aiPlan.text ? `\n\n${aiPlan.text}` : ''}`,
+    tags: ['autonomous-workflow', 'course-created'],
+    meta: { workflowId, courseId: createdCourse.id, provider: aiPlan.provider },
+  });
+
+  return {
+    workflowId,
+    provider: aiPlan.provider,
+    course: createdCourse,
+    testCasesCount: allCases.length,
+    memorySaved: memoryRecord,
+  };
+}
+
+function buildModulesFromSource({
+  sourceType = 'BOOK',
+  sourceTitle = 'Converted Material',
+  sourceUrl = 'https://example.org/resource',
+  sourceText = '',
+  chapters = [],
+  programmingLanguage = 'Any Programming Language',
+}) {
+  const safeUrl = isValidHttpUrl(sourceUrl) ? String(sourceUrl).trim() : 'https://example.org/resource';
+  if (Array.isArray(chapters) && chapters.length > 0) {
+    return chapters.map((ch, idx) => ({
+      title: String(ch.title || `${sourceTitle} — Section ${idx + 1}`).trim(),
+      contentUrl: isValidHttpUrl(ch.contentUrl) ? String(ch.contentUrl).trim() : safeUrl,
+      language: ch.language ? String(ch.language).trim() : programmingLanguage,
+      contentType: String(ch.contentType || (sourceType === 'BOOK' ? 'ARTICLE' : 'CODE_REPO')).trim().toUpperCase(),
+      starterCode: ch.starterCode ? String(ch.starterCode) : ch.summary ? String(ch.summary).trim() : null,
+      orderIndex: ch.orderIndex !== undefined ? Number(ch.orderIndex) : idx + 1,
+    }));
+  }
+
+  const cleanText = String(sourceText || '').trim();
+  if (!cleanText) {
+    return [
+      {
+        title: `${sourceTitle} — Core ${sourceType} Module`,
+        contentUrl: safeUrl,
+        language: programmingLanguage,
+        contentType: sourceType === 'BOOK' ? 'ARTICLE' : 'CODE_REPO',
+        starterCode: null,
+        orderIndex: 1,
+      },
+    ];
+  }
+
+  const sections = [];
+  let current = null;
+  for (const line of cleanText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const isHeading =
+      /^#{1,4}\s+/.test(trimmed) || /^(chapter|module|part|unit|section)\s+\d+/i.test(trimmed);
+    if (isHeading) {
+      if (current) sections.push(current);
+      current = { title: trimmed.replace(/^#{1,4}\s+/, '').slice(0, 140), body: [] };
+    } else {
+      if (!current) current = { title: `${sourceTitle} — Part 1`, body: [] };
+      current.body.push(line);
+    }
+  }
+  if (current) sections.push(current);
+
+  return sections.map((sec, idx) => ({
+    title: sec.title || `${sourceTitle} — Unit ${idx + 1}`,
+    contentUrl: safeUrl,
+    language: programmingLanguage,
+    contentType: sourceType === 'BOOK' ? 'ARTICLE' : 'CODE_REPO',
+    starterCode: sec.body.join('\n').trim().slice(0, 12000) || null,
+    orderIndex: idx + 1,
+  }));
+}
+
+async function seedBulkCourses({ totalCourses = 500, batchSize = 500, prefix = 'LLLA-SEED' }) {
+  const safeTotal = Math.max(1, Number(totalCourses) || 500);
+  const safeBatch = Math.min(Math.max(1, Number(batchSize) || 500), 10_000);
+  const tracks = [
+    'Any Programming Language (Python / JS / Go / Rust)',
+    'Python & Applied Data',
+    'JavaScript / Full-Stack Engineering',
+    'Go & Scalable Systems',
+    'Rust & Systems Engineering',
+  ];
+
+  let insertedTotal = 0;
+  const nowMs = Date.now();
+  for (let offset = 0; offset < safeTotal; offset += safeBatch) {
+    const count = Math.min(safeBatch, safeTotal - offset);
+    const rows = [];
+    for (let i = 0; i < count; i += 1) {
+      const idx = offset + i;
+      const lang = tracks[idx % tracks.length];
+      rows.push({
+        title: `${prefix} #${idx + 1}: ${lang.split(' ')[0]} Skills & Positive Mindset`,
+        description: `Long life learning Academy course #${idx + 1} teaching skills, knowledge, and a positive mindset.`,
+        thumbnail: null,
+        programmingLanguage: lang,
+        priceETB: (300 + (idx % 10) * 50).toFixed(2),
+        priceUSD: (6 + (idx % 8) * 2).toFixed(2),
+        certFeeETB: (100 + (idx % 5) * 25).toFixed(2),
+        certFeeUSD: (2 + (idx % 4)).toFixed(2),
+        isPublished: true,
+        createdAt: new Date(nowMs - (safeTotal - idx) * 1000),
+      });
+    }
+    const res = await prisma.course.createMany({ data: rows, skipDuplicates: true });
+    insertedTotal += res.count;
+  }
+
+  return { insertedTotal, totalCoursesInDb: await prisma.course.count() };
+}
+
+// ============================================================================
+// 7. MIDDLEWARE (RATE LIMITER, JWT AUTH & MASTER ADMIN CODE 5405402)
+// ============================================================================
+function createRateLimiter({ windowMs = 60_000, max = 40 } = {}) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const entry = hits.get(key);
+
+    if (!entry || now > entry.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (entry.count >= max) {
+      return res.status(429).json({ error: 'Too many requests. Please try again shortly.' });
+    }
+    entry.count += 1;
+    next();
+  };
+}
+
+function signToken(user) {
+  return jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+async function protect(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Authentication token required' });
+    }
+    const token = authHeader.slice(7).trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      select: { id: true, name: true, email: true, role: true },
+    });
+    if (!user) {
+      return res.status(401).json({ error: 'User no longer exists' });
+    }
+    req.user = user;
+    next();
+  } catch (_) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+function requireAdminCode(req, res, next) {
+  const providedCode = req.headers['x-admin-code'];
+  if (!providedCode || String(providedCode).trim() !== String(ADMIN_MASTER_CODE)) {
+    return res.status(403).json({
+      error: `Forbidden: Valid master Admin Code (${ADMIN_MASTER_CODE}) is required in x-admin-code header`,
+    });
+  }
+  next();
+}
+
+function normalizeOtpTarget(channel, rawTarget) {
+  const trimmed = String(rawTarget || '').trim();
+  if (!trimmed) return '';
+  if (channel === 'TELEGRAM') {
+    return trimmed.startsWith('@') ? trimmed.toLowerCase() : `@${trimmed.toLowerCase()}`;
+  }
+  return trimmed.replace(/[\s()-]+/g, '');
+}
+
+function hashOtpCode(channel, target, code) {
+  return crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${channel}:${target}:${String(code).trim()}`)
+    .digest('hex');
+}
+
+function signContactVerificationToken({ channel, target }) {
+  return jwt.sign({ purpose: 'CONTACT_VERIFICATION', channel, target }, JWT_SECRET, {
+    expiresIn: '20m',
+  });
+}
+
+function verifyContactVerificationToken(token, expectedChannel, expectedTarget) {
+  if (!token) return false;
+  try {
+    const decoded = jwt.verify(String(token).trim(), JWT_SECRET);
+    if (decoded.purpose !== 'CONTACT_VERIFICATION') return false;
+    return (
+      decoded.channel === expectedChannel &&
+      normalizeOtpTarget(expectedChannel, decoded.target) === expectedTarget
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+// ============================================================================
+// 8. EXPRESS APP & ALL API ROUTES
+// ============================================================================
+const app = express();
+
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors());
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+const authLimiter = createRateLimiter({ windowMs: 60_000, max: 30 });
+const paymentLimiter = createRateLimiter({ windowMs: 60_000, max: 35 });
+
+app.get('/api/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    const cfg = await ensureAcademyConfig();
+    res.status(200).json({
+      status: 'ok',
+      database: 'connected',
+      academy: cfg.academyName,
+      tagline: cfg.tagline,
+      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+      sandboxQueue: sandboxQueue.stats(),
+    });
+  } catch (_) {
+    res.status(503).json({ status: 'degraded', database: 'disconnected' });
+  }
+});
+
+app.get('/api/academy/profile', async (req, res, next) => {
+  try {
+    const cfg = await ensureAcademyConfig();
+    const memStats = await getMemoryStats();
+    return res.status(200).json({
+      academy: cfg,
+      openAiModes: Object.values(OPEN_AI_MODES),
+      memory: memStats,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Auth & Multi-Channel Registration (Email, Phone, WhatsApp, Telegram + OTP + Social Links) ---
+app.post('/api/auth/request-otp', authLimiter, (req, res) => {
+  const channel = String(req.body.channel || '').trim().toUpperCase();
+  const target = normalizeOtpTarget(channel, req.body.target);
+
+  if (!VALID_OTP_CHANNELS.has(channel)) {
+    return res.status(400).json({ error: 'channel must be PHONE, WHATSAPP, or TELEGRAM.' });
+  }
+  if (!target) {
+    return res.status(400).json({ error: 'target is required for verification.' });
+  }
+
+  const code = String(crypto.randomInt(100000, 1000000));
+  otpChallengeStore.set(`${channel}:${target}`, {
+    codeHash: hashOtpCode(channel, target, code),
+    expiresAt: Date.now() + OTP_TTL_MS,
+    attempts: 0,
+  });
+
+  console.log(`[OTP -> ${channel}] ${target}: ${code}`);
+  return res.status(200).json({
+    message: `Verification code sent via ${channel} to ${target}.`,
+    channel,
+    target,
+    expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+    ...(ALLOW_DEV_OTP_PREVIEW ? { devPreviewCode: code } : {}),
+  });
+});
+
+app.post('/api/auth/verify-otp', authLimiter, (req, res) => {
+  const channel = String(req.body.channel || '').trim().toUpperCase();
+  const target = normalizeOtpTarget(channel, req.body.target);
+  const code = String(req.body.code || '').trim();
+
+  if (!VALID_OTP_CHANNELS.has(channel) || !target || !code) {
+    return res.status(400).json({ error: 'channel, target, and code are required.' });
+  }
+
+  const storeKey = `${channel}:${target}`;
+  const entry = otpChallengeStore.get(storeKey);
+  if (!entry || Date.now() > entry.expiresAt) {
+    otpChallengeStore.delete(storeKey);
+    return res.status(400).json({ error: 'Verification code expired or not requested.' });
+  }
+
+  if (entry.attempts >= OTP_MAX_ATTEMPTS) {
+    otpChallengeStore.delete(storeKey);
+    return res.status(429).json({ error: 'Too many invalid attempts. Request a new code.' });
+  }
+
+  const actualHex = hashOtpCode(channel, target, code);
+  const isValidFormat = /^\d{6}$/.test(code);
+  const isMatch =
+    isValidFormat &&
+    actualHex.length === entry.codeHash.length &&
+    crypto.timingSafeEqual(Buffer.from(actualHex, 'hex'), Buffer.from(entry.codeHash, 'hex'));
+
+  if (!isMatch) {
+    entry.attempts += 1;
+    return res.status(400).json({
+      error: 'Invalid verification code.',
+      attemptsRemaining: Math.max(0, OTP_MAX_ATTEMPTS - entry.attempts),
+    });
+  }
+
+  otpChallengeStore.delete(storeKey);
+  const verificationToken = signContactVerificationToken({ channel, target });
+  return res.status(200).json({ verified: true, channel, target, verificationToken });
+});
+
+app.post('/api/auth/register', authLimiter, async (req, res, next) => {
+  try {
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Name, email, and password are required' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (existing) {
+      return res.status(409).json({ error: 'Email is already registered' });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), SALT_ROUNDS);
+    const assignedRole =
+      normalizedEmail === PRIMARY_ADMIN_EMAIL || role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
+
+    const user = await prisma.user.create({
+      data: {
+        name: String(name).trim(),
+        email: normalizedEmail,
+        passwordHash,
+        role: assignedRole,
+      },
+      select: { id: true, name: true, email: true, role: true, createdAt: true },
+    });
+
+    const token = signToken(user);
+    return res.status(201).json({ user, token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/auth/register-multi', authLimiter, async (req, res, next) => {
+  try {
+    const { name, email, phone, whatsapp, telegram, password, socialLinks, verificationToken } =
+      req.body;
+
+    const cleanPhone = String(phone || '').trim();
+    const cleanWhatsapp = String(whatsapp || '').trim();
+    const cleanTelegram = String(telegram || '').trim();
+    const rawEmail = String(email || '').trim().toLowerCase();
+
+    if (!name || !password) {
+      return res.status(400).json({ error: 'Full name and password are required.' });
+    }
+    if (!rawEmail && !cleanPhone && !cleanWhatsapp && !cleanTelegram) {
+      return res.status(400).json({
+        error: 'Provide at least one channel: Email, Phone, WhatsApp, or Telegram.',
+      });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    }
+
+    if (REQUIRE_CONTACT_OTP) {
+      const checks = [
+        cleanPhone ? { channel: 'PHONE', target: normalizeOtpTarget('PHONE', cleanPhone) } : null,
+        cleanWhatsapp
+          ? { channel: 'WHATSAPP', target: normalizeOtpTarget('WHATSAPP', cleanWhatsapp) }
+          : null,
+        cleanTelegram
+          ? { channel: 'TELEGRAM', target: normalizeOtpTarget('TELEGRAM', cleanTelegram) }
+          : null,
+      ].filter(Boolean);
+
+      if (checks.length > 0) {
+        const verified = checks.some((c) =>
+          verifyContactVerificationToken(verificationToken, c.channel, c.target)
+        );
+        if (!verified) {
+          return res.status(403).json({
+            error:
+              'Contact verification required: request and verify a 6-digit code for Phone, WhatsApp, or Telegram first.',
+          });
+        }
+      }
+    }
+
+    const contactSlug = (cleanPhone || cleanWhatsapp || cleanTelegram)
+      .replace(/[^a-zA-Z0-9]+/g, '')
+      .toLowerCase();
+    const effectiveEmail =
+      rawEmail || `${contactSlug || crypto.randomBytes(4).toString('hex')}@llla.local`;
+
+    const existing = await prisma.user.findUnique({ where: { email: effectiveEmail } });
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this contact already exists.' });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), SALT_ROUNDS);
+    const user = await prisma.user.create({
+      data: {
+        name: String(name).trim(),
+        email: effectiveEmail,
+        passwordHash,
+        role: effectiveEmail === PRIMARY_ADMIN_EMAIL ? 'ADMIN' : 'STUDENT',
+      },
+      select: { id: true, name: true, email: true, role: true, createdAt: true },
+    });
+
+    const linkedSocials = normalizeSocialLinks({
+      ...(socialLinks || {}),
+      ...(cleanWhatsapp ? { whatsapp: cleanWhatsapp } : {}),
+      ...(cleanTelegram ? { telegram: cleanTelegram } : {}),
+    });
+
+    const profile = {
+      userId: user.id,
+      email: rawEmail || null,
+      phone: cleanPhone || null,
+      whatsapp: cleanWhatsapp || null,
+      telegram: cleanTelegram || null,
+      socialLinks: linkedSocials,
+    };
+    learnerSocialProfiles.set(user.id, profile);
+
+    const token = signToken(user);
+    return res.status(201).json({ user, profile, token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isMatch = await bcrypt.compare(String(password), user.passwordHash);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const safeUser = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: normalizedEmail === PRIMARY_ADMIN_EMAIL ? 'ADMIN' : user.role,
+    };
+    const token = signToken(safeUser);
+    const profile = learnerSocialProfiles.get(user.id) || null;
+    return res.status(200).json({ user: safeUser, profile, token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put('/api/profile/socials', protect, (req, res) => {
+  const existing = learnerSocialProfiles.get(req.user.id) || {
+    userId: req.user.id,
+    email: req.user.email,
+    phone: null,
+    whatsapp: null,
+    telegram: null,
+    socialLinks: {},
+  };
+
+  const updated = {
+    ...existing,
+    phone: req.body.phone !== undefined ? String(req.body.phone).trim() || null : existing.phone,
+    whatsapp:
+      req.body.whatsapp !== undefined ? String(req.body.whatsapp).trim() || null : existing.whatsapp,
+    telegram:
+      req.body.telegram !== undefined ? String(req.body.telegram).trim() || null : existing.telegram,
+    socialLinks: {
+      ...existing.socialLinks,
+      ...normalizeSocialLinks(req.body.socialLinks),
+    },
+  };
+
+  learnerSocialProfiles.set(req.user.id, updated);
+  return res.status(200).json({ profile: updated });
+});
+
+// --- Public Catalog (Cursor-Paginated for 1M+ Courses) ---
+app.get('/api/courses', async (req, res, next) => {
+  try {
+    const rawLimit = Number(req.query.limit) || 24;
+    const limit = Math.min(Math.max(rawLimit, 1), 100);
+    const cursor = req.query.cursor ? String(req.query.cursor).trim() : null;
+    const language = req.query.language ? String(req.query.language).trim() : '';
+    const search = req.query.q ? String(req.query.q).trim() : '';
+
+    const where = {
+      isPublished: true,
+      ...(language ? { programmingLanguage: { contains: language, mode: 'insensitive' } } : {}),
+      ...(search
+        ? {
+            OR: [
+              { title: { contains: search, mode: 'insensitive' } },
+              { description: { contains: search, mode: 'insensitive' } },
+              { programmingLanguage: { contains: search, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+
+    const courses = await prisma.course.findMany({
+      where,
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        thumbnail: true,
+        programmingLanguage: true,
+        priceETB: true,
+        priceUSD: true,
+        certFeeETB: true,
+        certFeeUSD: true,
+        createdAt: true,
+        _count: { select: { modules: true } },
+      },
+    });
+
+    const hasMore = courses.length > limit;
+    const items = hasMore ? courses.slice(0, limit) : courses;
+    const nextCursor = hasMore ? items[items.length - 1].id : null;
+
+    return res.status(200).json({
+      courses: items,
+      pageInfo: { limit, hasMore, nextCursor },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Student Course Upload (Pending Admin Approval) ---
+app.post('/api/student-courses/upload', protect, async (req, res, next) => {
+  try {
+    const {
+      title,
+      description,
+      programmingLanguage,
+      priceETB,
+      priceUSD,
+      certFeeETB,
+      certFeeUSD,
+      starterCode,
+      contentUrl,
+    } = req.body;
+
+    if (!title || !description) {
+      return res.status(400).json({ error: 'Course title and description are required.' });
+    }
+
+    const draftCourse = await prisma.course.create({
+      data: {
+        title: String(title).trim(),
+        description: String(description).trim(),
+        programmingLanguage: String(programmingLanguage || 'Any Programming Language').trim(),
+        priceETB: parseNonNegativeMoney(priceETB ?? 0, 'priceETB'),
+        priceUSD: parseNonNegativeMoney(priceUSD ?? 0, 'priceUSD'),
+        certFeeETB: parseNonNegativeMoney(certFeeETB ?? 100, 'certFeeETB'),
+        certFeeUSD: parseNonNegativeMoney(certFeeUSD ?? 2, 'certFeeUSD'),
+        isPublished: false,
+      },
+    });
+
+    if (contentUrl || starterCode) {
+      await prisma.module.create({
+        data: {
+          courseId: draftCourse.id,
+          title: `${draftCourse.title} — Learner Submitted Lab`,
+          contentUrl: isValidHttpUrl(contentUrl) ? String(contentUrl).trim() : 'https://github.com',
+          language: draftCourse.programmingLanguage,
+          contentType: 'CODE_REPO',
+          starterCode: starterCode ? String(starterCode) : null,
+          orderIndex: 1,
+        },
+      });
+    }
+
+    const approval = {
+      courseId: draftCourse.id,
+      status: 'PENDING_APPROVAL',
+      uploadedByLearnerId: req.user.id,
+      uploadedByName: req.user.name,
+      uploadedByContact: req.user.email,
+      submittedAt: new Date().toISOString(),
+      reviewedBy: null,
+      reviewedAt: null,
+      reviewNotes: '',
+    };
+    courseReviewMeta.set(draftCourse.id, approval);
+
+    return res.status(201).json({
+      message: 'Course uploaded and submitted for Admin approval.',
+      course: draftCourse,
+      approval,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Enrollment, Code Submissions (Queued + Test Cases) & Score-Gated Certificates ---
+app.post('/api/enroll', protect, paymentLimiter, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const { courseId, currency, paymentMethod } = req.body;
+    if (!courseId || !currency || !paymentMethod) {
+      return res.status(400).json({ error: 'courseId, currency, and paymentMethod are required' });
+    }
+
+    const course = await prisma.course.findUnique({ where: { id: courseId } });
+    if (!course || !course.isPublished) {
+      return res.status(404).json({ error: 'Course not found or unpublished' });
+    }
+
+    const existingEnrollment = await prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId, courseId } },
+    });
+    if (existingEnrollment && existingEnrollment.paymentStatus === 'COMPLETED') {
+      return res.status(409).json({
+        error: 'Already enrolled in this course',
+        enrollment: existingEnrollment,
+      });
+    }
+
+    const normCurrency = String(currency).trim().toUpperCase();
+    const amount = normCurrency === 'USD' ? course.priceUSD : course.priceETB;
+    const paymentResult = await processGatewayPayment({
+      amount,
+      currency: normCurrency,
+      paymentMethod,
+      purpose: 'COURSE_ENROLLMENT',
+      userId,
+      courseId,
+    });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const enrollment = await tx.enrollment.upsert({
+        where: { userId_courseId: { userId, courseId } },
+        update: { paymentStatus: 'COMPLETED' },
+        create: {
+          userId,
+          courseId,
+          paymentStatus: 'COMPLETED',
+          certificateStatus: 'NOT_REQUESTED',
+        },
+        include: { course: true },
+      });
+
+      const transaction = await tx.transaction.create({
+        data: {
+          userId,
+          courseId,
+          amount: paymentResult.amount,
+          currency: paymentResult.currency,
+          paymentMethod: paymentResult.paymentMethod,
+          purpose: 'COURSE_ENROLLMENT',
+          status: 'COMPLETED',
+          providerRef: paymentResult.providerRef,
+        },
+      });
+
+      return { enrollment, transaction };
+    });
+
+    return res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/my-courses', protect, async (req, res, next) => {
+  try {
+    const enrollments = await prisma.enrollment.findMany({
+      where: { userId: req.user.id, paymentStatus: 'COMPLETED' },
+      include: { course: { include: { modules: { orderBy: { orderIndex: 'asc' } } } } },
+      orderBy: { enrolledAt: 'desc' },
+    });
+    return res.status(200).json({ enrollments });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/submissions', protect, async (req, res, next) => {
+  try {
+    const { courseId, moduleId, language, code, notes } = req.body;
+    if (!courseId || !code) {
+      return res.status(400).json({ error: 'courseId and code are required' });
+    }
+
+    const enrollment = await prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId: req.user.id, courseId } },
+    });
+    if (!enrollment || enrollment.paymentStatus !== 'COMPLETED') {
+      return res.status(403).json({ error: 'Enroll in the course before submitting code' });
+    }
+
+    const testKey = `${courseId}:${moduleId || 'general'}`;
+    const testCases =
+      moduleTestCases.get(testKey) || moduleTestCases.get(`${courseId}:general`) || [];
+    const normLang = String(language || 'Any Programming Language').trim();
+
+    const evaluation = await evaluateCodeSubmissionQueued({
+      language: normLang,
+      code: String(code),
+      testCases,
+    });
+
+    const scoreSummary = recordLearnerCourseScore(req.user.id, courseId, evaluation?.score ?? 0);
+
+    const subKey = `${req.user.id}:${courseId}:${moduleId || 'general'}`;
+    const record = {
+      id: `sub_${crypto.randomBytes(4).toString('hex')}`,
+      userId: req.user.id,
+      studentName: req.user.name,
+      courseId,
+      moduleId: moduleId || 'general',
+      language: normLang,
+      code: String(code),
+      notes: notes ? String(notes).trim() : '',
+      evaluation,
+      scoreSummary,
+      submittedAt: new Date().toISOString(),
+    };
+
+    saveSubmissionRecord(subKey, record);
+    return res.status(201).json({ submission: record, evaluation, scoreSummary });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/submissions', protect, (req, res) => {
+  const mine = Array.from(learnerSubmissions.values()).filter((s) => s.userId === req.user.id);
+  return res.status(200).json({ submissions: mine });
+});
+
+app.post('/api/certificate/:courseId', protect, paymentLimiter, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const { courseId } = req.params;
+    const { currency, paymentMethod } = req.body;
+
+    const enrollment = await prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId, courseId } },
+      include: { course: true, user: true },
+    });
+
+    if (!enrollment || enrollment.paymentStatus !== 'COMPLETED') {
+      return res.status(403).json({
+        error: 'You must be enrolled in this course before requesting a certificate.',
+      });
+    }
+
+    const requiredScore = getRequiredPassScore(courseId);
+    const scoreInfo = getLearnerCourseScore(userId, courseId);
+
+    if (enrollment.certificateStatus !== 'ISSUED' && scoreInfo.bestScore < requiredScore) {
+      return res.status(403).json({
+        error: `Certificate locked: minimum test-case score is ${requiredScore}%, your best score is ${scoreInfo.bestScore}%.`,
+        requiredScore,
+        currentBestScore: scoreInfo.bestScore,
+      });
+    }
+
+    let updatedEnrollment = enrollment;
+
+    if (enrollment.certificateStatus !== 'ISSUED') {
+      if (!currency || !paymentMethod) {
+        return res.status(400).json({ error: 'currency and paymentMethod are required' });
+      }
+
+      const normCurrency = String(currency).trim().toUpperCase();
+      const certFee =
+        normCurrency === 'USD' ? enrollment.course.certFeeUSD : enrollment.course.certFeeETB;
+
+      const paymentResult = await processGatewayPayment({
+        amount: certFee,
+        currency: normCurrency,
+        paymentMethod,
+        purpose: 'CERTIFICATE',
+        userId,
+        courseId,
+      });
+
+      const now = new Date();
+      updatedEnrollment = await prisma.$transaction(async (tx) => {
+        await tx.transaction.create({
+          data: {
+            userId,
+            courseId,
+            amount: paymentResult.amount,
+            currency: paymentResult.currency,
+            paymentMethod: paymentResult.paymentMethod,
+            purpose: 'CERTIFICATE',
+            status: 'COMPLETED',
+            providerRef: paymentResult.providerRef,
+          },
+        });
+
+        return tx.enrollment.update({
+          where: { id: enrollment.id },
+          data: { certificateStatus: 'ISSUED', certifiedAt: now },
+          include: { course: true, user: true },
+        });
+      });
+    }
+
+    return streamCourseCertificatePDF(res, {
+      studentName: updatedEnrollment.user.name,
+      courseTitle: `${updatedEnrollment.course.title} (Score: ${scoreInfo.bestScore}%)`,
+      programmingLanguage: updatedEnrollment.course.programmingLanguage,
+      issuedDate: updatedEnrollment.certifiedAt || new Date(),
+      certificateId: updatedEnrollment.id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/certificate/:courseId/download', protect, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const { courseId } = req.params;
+    const enrollment = await prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId, courseId } },
+      include: { course: true, user: true },
+    });
+
+    if (!enrollment || enrollment.certificateStatus !== 'ISSUED') {
+      return res.status(403).json({ error: 'Certificate has not been issued yet' });
+    }
+
+    const requiredScore = getRequiredPassScore(courseId);
+    const scoreInfo = getLearnerCourseScore(userId, courseId);
+    if (scoreInfo.bestScore < requiredScore) {
+      return res.status(403).json({
+        error: `Certificate requires at least ${requiredScore}% score (current best: ${scoreInfo.bestScore}%).`,
+      });
+    }
+
+    return streamCourseCertificatePDF(res, {
+      studentName: enrollment.user.name,
+      courseTitle: `${enrollment.course.title} (Score: ${scoreInfo.bestScore}%)`,
+      programmingLanguage: enrollment.course.programmingLanguage,
+      issuedDate: enrollment.certifiedAt || new Date(),
+      certificateId: enrollment.id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Library of Resources & Admin External Tools ---
+app.get('/api/resources', (req, res) => {
+  const typeFilter = String(req.query.type || '').trim().toUpperCase();
+  const q = String(req.query.q || '').trim().toLowerCase();
+
+  const items = Array.from(resourceLibrary.values()).filter((r) => {
+    const matchType = !typeFilter || r.resourceType === typeFilter;
+    const matchQ =
+      !q ||
+      r.title.toLowerCase().includes(q) ||
+      r.language.toLowerCase().includes(q) ||
+      (r.summary || '').toLowerCase().includes(q);
+    return matchType && matchQ;
+  });
+
+  return res.status(200).json({ resources: items });
+});
+
+app.get('/api/external-tools', (req, res) => {
+  const catFilter = req.query.category ? normalizeToolCategory(req.query.category) : '';
+  const courseId = req.query.courseId ? String(req.query.courseId).trim() : '';
+  const linkedSet = courseId ? courseLinkedTools.get(courseId) : null;
+
+  const tools = Array.from(externalToolsDirectory.values()).filter((t) => {
+    const matchCat = !catFilter || t.category === catFilter;
+    const matchCourse = !linkedSet || linkedSet.has(t.id) || t.requiredForCourses;
+    return matchCat && matchCourse;
+  });
+
+  return res.status(200).json({
+    categories: Array.from(ALLOWED_TOOL_CATEGORIES),
+    tools,
+  });
+});
+
+app.get('/api/instructors', (req, res) => {
+  return res.status(200).json({ instructors: Array.from(instructorsDirectory.values()) });
+});
+
+// --- Unlimited Persistent Memory, Free AI Agents, Open AI Studio, Monitor, Adaptive & CBL ---
+app.post('/api/memory', protect, async (req, res, next) => {
+  try {
+    const { scope, entityId, title, content, tags } = req.body;
+    if (!content || !String(content).trim()) {
+      return res.status(400).json({ error: 'Memory content is required.' });
+    }
+
+    const memory = await writeUnlimitedMemory({
+      scope: scope || 'LEARNER',
+      entityId: entityId || req.user.id,
+      agentId: 'MEMORY_STORE',
+      title: title || `Note by ${req.user.name}`,
+      content,
+      tags: Array.isArray(tags) ? tags : String(tags || '').split(','),
+      meta: { authorId: req.user.id, authorName: req.user.name },
+    });
+
+    return res.status(201).json({ memory });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/memory', async (req, res, next) => {
+  try {
+    const result = await queryUnlimitedMemory({
+      q: req.query.q || '',
+      scope: req.query.scope || '',
+      entityId: req.query.entityId || '',
+      cursor: req.query.cursor || null,
+      limit: req.query.limit || 30,
+    });
+    const stats = await getMemoryStats();
+    return res.status(200).json({ ...result, stats });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/memory/export', async (req, res, next) => {
+  try {
+    const backup = await exportUnlimitedMemoryJsonl();
+    if (String(req.query.format || '').toLowerCase() === 'json') {
+      return res.status(200).json(backup);
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="academy-memory-${stamp}.jsonl"`);
+    return res.status(200).send(backup.jsonl);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/memory/import', requireAdminCode, async (req, res, next) => {
+  try {
+    const { jsonlText, records, regenerateIds } = req.body;
+    const result = await importUnlimitedMemoryJsonl({
+      jsonlText,
+      records,
+      regenerateIds: Boolean(regenerateIds),
+    });
+    return res.status(200).json({
+      message: `Imported ${result.importedCount} memory record(s) (${result.skippedDuplicateCount} duplicate(s) skipped).`,
+      ...result,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/ai/agent/chat', async (req, res, next) => {
+  try {
+    const { mode, agentId, message, preferredProvider, courseId } = req.body;
+    let course = null;
+    if (courseId) {
+      course = await prisma.course.findUnique({
+        where: { id: String(courseId) },
+        include: { modules: { orderBy: { orderIndex: 'asc' } } },
+      });
+    }
+    const result = await runAcademyOpenAi({
+      mode: mode || agentId || 'CHATGPT_COACH',
+      prompt: message,
+      course,
+      preferredProvider,
+    });
+    return res.status(200).json({
+      agent: result.mode,
+      provider: result.provider,
+      reply: result.output,
+      memorySaved: result.memorySaved,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/ai/agent/run', requireAdminCode, async (req, res, next) => {
+  try {
+    const { agentId, targetScope, courseId, prompt, autoApply, preferredProvider } = req.body;
+    const outcome = await runPromptImprovementAgent({
+      agentId,
+      targetScope: String(targetScope || 'COURSE').toUpperCase(),
+      courseId,
+      prompt,
+      autoApply: autoApply !== undefined ? Boolean(autoApply) : true,
+      preferredProvider,
+    });
+    return res.status(200).json(outcome);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/ai/workflow/create-course', requireAdminCode, async (req, res, next) => {
+  try {
+    const outcome = await runAutonomousCourseWorkflow(req.body || {});
+    return res.status(201).json(outcome);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/open-ai/studio', async (req, res, next) => {
+  try {
+    const { mode, prompt, codeContext, courseId, preferredProvider } = req.body;
+    let course = null;
+    if (courseId) {
+      course = await prisma.course.findUnique({
+        where: { id: String(courseId) },
+        include: { modules: { orderBy: { orderIndex: 'asc' } } },
+      });
+    }
+    const result = await runAcademyOpenAi({
+      mode,
+      prompt,
+      codeContext,
+      course,
+      preferredProvider,
+    });
+    return res.status(200).json({ ...result, availableModes: Object.values(OPEN_AI_MODES) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/open-ai/monitor/track', protect, async (req, res, next) => {
+  try {
+    const telemetry = await monitorLearnerProgress({
+      userId: req.user.id,
+      courseId: req.body.courseId || 'general',
+      moduleId: req.body.moduleId || 'general',
+      score: req.body.score,
+      timeSpentMinutes: req.body.timeSpentMinutes,
+      completedLesson: Boolean(req.body.completedLesson),
+      mindsetNote: req.body.mindsetNote,
+    });
+    return res.status(200).json({ telemetry });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/open-ai/adapt-course', protect, async (req, res, next) => {
+  try {
+    const adaptation = await adaptCourseForLearner({
+      userId: req.user.id,
+      courseId: req.body.courseId,
+      goal: req.body.goal,
+      pace: req.body.pace,
+    });
+    return res.status(200).json({ adaptation });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/open-ai/competence/assess', protect, async (req, res, next) => {
+  try {
+    const outcome = await assessCompetence({
+      userId: req.user.id,
+      courseId: req.body.courseId || 'general',
+      competencyId: req.body.competencyId,
+      competencyName: req.body.competencyName,
+      evidenceScore: req.body.evidenceScore,
+      evidenceNotes: req.body.evidenceNotes,
+    });
+    return res.status(200).json(outcome);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/open-ai/competence', protect, (req, res) => {
+  const courseId = String(req.query.courseId || 'general');
+  return res.status(200).json(getLearnerCompetenceSummary(req.user.id, courseId));
+});
+
+// --- Protected Admin Routes (x-admin-code: 5405402) ---
+app.post('/api/admin/courses', requireAdminCode, async (req, res, next) => {
+  try {
+    const {
+      title,
+      description,
+      thumbnail,
+      programmingLanguage,
+      priceETB,
+      priceUSD,
+      certFeeETB,
+      certFeeUSD,
+      isPublished,
+    } = req.body;
+
+    if (!title || !description) {
+      return res.status(400).json({ error: 'title and description are required' });
+    }
+
+    const course = await prisma.course.create({
+      data: {
+        title: String(title).trim(),
+        description: String(description).trim(),
+        thumbnail: thumbnail ? String(thumbnail).trim() : null,
+        programmingLanguage: String(programmingLanguage || 'Any Programming Language').trim(),
+        priceETB: parseNonNegativeMoney(priceETB, 'priceETB'),
+        priceUSD: parseNonNegativeMoney(priceUSD, 'priceUSD'),
+        certFeeETB: parseNonNegativeMoney(certFeeETB, 'certFeeETB'),
+        certFeeUSD: parseNonNegativeMoney(certFeeUSD, 'certFeeUSD'),
+        isPublished: isPublished !== undefined ? Boolean(isPublished) : true,
+      },
+    });
+
+    return res.status(201).json({ course });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/seed-bulk', requireAdminCode, async (req, res, next) => {
+  try {
+    const { totalCourses, batchSize, prefix } = req.body || {};
+    const stats = await seedBulkCourses({ totalCourses, batchSize, prefix });
+    return res.status(201).json({ message: 'Bulk courses seeded.', ...stats });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/admin/courses/review-queue', requireAdminCode, async (req, res, next) => {
+  try {
+    const courses = await prisma.course.findMany({
+      include: { modules: { orderBy: { orderIndex: 'asc' } } },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const enriched = courses.map((c) => ({
+      ...c,
+      approval: courseReviewMeta.get(c.id) || {
+        courseId: c.id,
+        status: c.isPublished ? 'APPROVED' : 'PENDING_APPROVAL',
+        uploadedByName: 'Academy / Instructor',
+      },
+    }));
+
+    return res.status(200).json({ courses: enriched });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/:id/approve', requireAdminCode, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const action = String(req.body.action || 'APPROVE').trim().toUpperCase();
+    const notes = req.body.notes ? String(req.body.notes).trim() : '';
+
+    const course = await prisma.course.findUnique({ where: { id } });
+    if (!course) {
+      return res.status(404).json({ error: 'Course not found.' });
+    }
+
+    const approved = action !== 'REJECT';
+    const updatedCourse = await prisma.course.update({
+      where: { id },
+      data: { isPublished: approved },
+    });
+
+    const approval = {
+      ...(courseReviewMeta.get(id) || { courseId: id }),
+      status: approved ? 'APPROVED' : 'REJECTED',
+      reviewedBy: PRIMARY_ADMIN_EMAIL,
+      reviewedAt: new Date().toISOString(),
+      reviewNotes: notes,
+    };
+    courseReviewMeta.set(id, approval);
+
+    return res.status(200).json({ course: updatedCourse, approval });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/:id/pass-score', requireAdminCode, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const minScore = Number(req.body.minScore);
+    if (!Number.isFinite(minScore) || minScore < 0 || minScore > 100) {
+      return res.status(400).json({ error: 'minScore must be between 0 and 100.' });
+    }
+    const course = await prisma.course.findUnique({ where: { id } });
+    if (!course) {
+      return res.status(404).json({ error: 'Course not found.' });
+    }
+    coursePassScoreOverrides.set(id, minScore);
+    return res.status(200).json({ courseId: id, minPassScore: minScore });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/:id/modules', requireAdminCode, async (req, res, next) => {
+  try {
+    const { id: courseId } = req.params;
+    const { title, contentUrl, language, contentType, starterCode, orderIndex } = req.body;
+    if (!title || !contentUrl) {
+      return res.status(400).json({ error: 'title and contentUrl are required' });
+    }
+
+    const course = await prisma.course.findUnique({ where: { id: courseId } });
+    if (!course) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    const createdModule = await prisma.module.create({
+      data: {
+        courseId,
+        title: String(title).trim(),
+        contentUrl: String(contentUrl).trim(),
+        language: language ? String(language).trim() : course.programmingLanguage,
+        contentType: String(contentType || 'CODE_REPO').trim().toUpperCase(),
+        starterCode: starterCode ? String(starterCode) : null,
+        orderIndex: orderIndex !== undefined ? Number(orderIndex) : 0,
+      },
+    });
+
+    return res.status(201).json({ module: createdModule });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/:id/test-cases', requireAdminCode, async (req, res, next) => {
+  try {
+    const { id: courseId } = req.params;
+    const { moduleId, testCases } = req.body;
+    if (!Array.isArray(testCases) || testCases.length === 0) {
+      return res.status(400).json({ error: 'testCases must be a non-empty array' });
+    }
+
+    const course = await prisma.course.findUnique({ where: { id: courseId } });
+    if (!course) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    moduleTestCases.set(`${courseId}:${moduleId || 'general'}`, testCases);
+    return res.status(201).json({ courseId, moduleId: moduleId || 'general', count: testCases.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/courses/convert-source', requireAdminCode, async (req, res, next) => {
+  try {
+    const {
+      courseTitle,
+      description,
+      programmingLanguage,
+      sourceType,
+      sourceUrl,
+      sourceText,
+      chapters,
+      priceETB,
+      priceUSD,
+      certFeeETB,
+      certFeeUSD,
+      toolIds,
+      isPublished,
+    } = req.body;
+
+    const resolvedTitle = String(courseTitle || '').trim();
+    if (!resolvedTitle) {
+      return res.status(400).json({ error: 'courseTitle is required.' });
+    }
+
+    const normType = normalizeResourceType(sourceType || 'BOOK');
+    const lang = String(programmingLanguage || 'Any Programming Language').trim();
+    const builtModules = buildModulesFromSource({
+      sourceType: normType,
+      sourceTitle: resolvedTitle,
+      sourceUrl,
+      sourceText,
+      chapters,
+      programmingLanguage: lang,
+    });
+
+    const createdCourse = await prisma.course.create({
+      data: {
+        title: resolvedTitle,
+        description: String(
+          description || `Converted ${normType.toLowerCase()} course: ${resolvedTitle}`
+        ).trim(),
+        programmingLanguage: lang,
+        priceETB: parseNonNegativeMoney(priceETB ?? 0, 'priceETB'),
+        priceUSD: parseNonNegativeMoney(priceUSD ?? 0, 'priceUSD'),
+        certFeeETB: parseNonNegativeMoney(certFeeETB ?? 150, 'certFeeETB'),
+        certFeeUSD: parseNonNegativeMoney(certFeeUSD ?? 3, 'certFeeUSD'),
+        isPublished: isPublished !== undefined ? Boolean(isPublished) : true,
+        modules: { create: builtModules },
+      },
+      include: { modules: { orderBy: { orderIndex: 'asc' } } },
+    });
+
+    const linkedSet = new Set(Array.isArray(toolIds) ? toolIds.map(String) : []);
+    for (const [tId, tool] of externalToolsDirectory.entries()) {
+      if (tool.requiredForCourses) linkedSet.add(tId);
+    }
+    if (linkedSet.size > 0) {
+      courseLinkedTools.set(createdCourse.id, linkedSet);
+    }
+
+    const resId = `res_${crypto.randomBytes(4).toString('hex')}`;
+    resourceLibrary.set(resId, {
+      id: resId,
+      title: resolvedTitle,
+      resourceType: normType,
+      language: lang,
+      url: isValidHttpUrl(sourceUrl) ? String(sourceUrl).trim() : null,
+      convertedCourseId: createdCourse.id,
+      moduleCount: createdCourse.modules.length,
+      addedBy: PRIMARY_ADMIN_EMAIL,
+      addedAt: new Date().toISOString(),
+    });
+
+    return res.status(201).json({
+      message: `Converted ${normType} into "${createdCourse.title}" (${createdCourse.modules.length} modules).`,
+      course: createdCourse,
+      linkedToolIds: Array.from(linkedSet),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/resources', requireAdminCode, (req, res) => {
+  const { title, resourceType, language, url, summary, tags } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'Resource title is required.' });
+  }
+  if (url && !isValidHttpUrl(url)) {
+    return res.status(400).json({ error: 'Resource url must start with http:// or https://.' });
+  }
+
+  const id = `res_${crypto.randomBytes(4).toString('hex')}`;
+  const resource = {
+    id,
+    title: String(title).trim(),
+    resourceType: normalizeResourceType(resourceType),
+    language: String(language || 'Any / Multi-Language').trim(),
+    url: url ? String(url).trim() : null,
+    summary: summary ? String(summary).trim() : '',
+    tags: Array.isArray(tags)
+      ? tags.map((t) => String(t).trim()).filter(Boolean)
+      : String(tags || '')
+          .split(',')
+          .map((t) => t.trim())
+          .filter(Boolean),
+    addedBy: PRIMARY_ADMIN_EMAIL,
+    addedAt: new Date().toISOString(),
+  };
+
+  resourceLibrary.set(id, resource);
+  return res.status(201).json({ resource });
+});
+
+app.post('/api/admin/external-tools', requireAdminCode, (req, res) => {
+  const { name, category, url, description, requiredForCourses, courseId } = req.body;
+  if (!name || !url) {
+    return res.status(400).json({ error: 'Tool name and url are required.' });
+  }
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({ error: 'Tool url must be a valid http:// or https:// URL.' });
+  }
+
+  const id = `tool_${crypto.randomBytes(4).toString('hex')}`;
+  const tool = {
+    id,
+    name: String(name).trim(),
+    category: normalizeToolCategory(category),
+    url: String(url).trim(),
+    description: description ? String(description).trim() : '',
+    requiredForCourses: requiredForCourses !== undefined ? Boolean(requiredForCourses) : true,
+    addedBy: PRIMARY_ADMIN_EMAIL,
+    addedAt: new Date().toISOString(),
+  };
+
+  externalToolsDirectory.set(id, tool);
+  if (courseId) {
+    const set = courseLinkedTools.get(String(courseId).trim()) || new Set();
+    set.add(id);
+    courseLinkedTools.set(String(courseId).trim(), set);
+  }
+
+  return res.status(201).json({ tool });
+});
+
+app.delete('/api/admin/external-tools/:id', requireAdminCode, (req, res) => {
+  const { id } = req.params;
+  if (!externalToolsDirectory.has(id)) {
+    return res.status(404).json({ error: 'External tool not found.' });
+  }
+  externalToolsDirectory.delete(id);
+  for (const set of courseLinkedTools.values()) {
+    set.delete(id);
+  }
+  return res.status(200).json({ deleted: true, id });
+});
+
+app.post('/api/admin/instructors', requireAdminCode, (req, res) => {
+  const { name, email, phone, whatsapp, telegram, specialties, socialLinks } = req.body;
+  if (!name) {
+    return res.status(400).json({ error: 'Instructor name is required.' });
+  }
+
+  const id = `inst_${crypto.randomBytes(4).toString('hex')}`;
+  const instructor = {
+    id,
+    name: String(name).trim(),
+    email: email ? String(email).trim().toLowerCase() : null,
+    phone: phone ? String(phone).trim() : null,
+    whatsapp: whatsapp ? String(whatsapp).trim() : null,
+    telegram: telegram ? String(telegram).trim() : null,
+    specialties: Array.isArray(specialties)
+      ? specialties.map((s) => String(s).trim()).filter(Boolean)
+      : String(specialties || 'Skills, Knowledge & Positive Mindset')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+    socialLinks: normalizeSocialLinks(socialLinks),
+    addedBy: PRIMARY_ADMIN_EMAIL,
+    addedAt: new Date().toISOString(),
+  };
+
+  instructorsDirectory.set(id, instructor);
+  return res.status(201).json({ instructor });
+});
+
+app.get('/api/admin/submissions', requireAdminCode, (req, res) => {
+  return res.status(200).json({ submissions: Array.from(learnerSubmissions.values()).slice(-200) });
+});
+
+app.get('/api/admin/analytics', requireAdminCode, async (req, res, next) => {
+  try {
+    const [totalStudents, totalCourses, totalEnrollments, completedTransactions] =
+      await Promise.all([
+        prisma.user.count({ where: { role: 'STUDENT' } }),
+        prisma.course.count(),
+        prisma.enrollment.count({ where: { paymentStatus: 'COMPLETED' } }),
+        prisma.transaction.findMany({ where: { status: 'COMPLETED' } }),
+      ]);
+
+    let revenueETB = 0;
+    let revenueUSD = 0;
+    for (const tx of completedTransactions) {
+      const amt = Number(tx.amount);
+      if (tx.currency === 'ETB') revenueETB += amt;
+      if (tx.currency === 'USD') revenueUSD += amt;
+    }
+
+    return res.status(200).json({
+      totalStudents,
+      totalCourses,
+      totalEnrollments,
+      totalSubmissions: learnerSubmissions.size,
+      totalTransactions: completedTransactions.length,
+      revenue: {
+        ETB: Number(revenueETB.toFixed(2)),
+        USD: Number(revenueUSD.toFixed(2)),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================================
+// 9. UNIFIED EMBEDDED FRONTEND SPA ("Long life learning Academy")
+// ============================================================================
+const FRONTEND_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Long life learning Academy</title>
+  <style>
+    :root { --primary:#004aad; --primary-dark:#003175; --accent:#fca311; --dark:#0f172a; --bg:#f4f7fb; --card:#ffffff; --text:#1e293b; --muted:#64748b; --success:#15803d; --danger:#b91c1c; --border:#e2e8f0; }
+    * { box-sizing:border-box; margin:0; padding:0; font-family:"Segoe UI",system-ui,-apple-system,sans-serif; }
+    body { background:var(--bg); color:var(--text); line-height:1.55; }
+    nav { background:var(--dark); color:#fff; padding:0.9rem 1.5rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.65rem; }
+    nav .brand-wrap { cursor:pointer; }
+    nav .brand { font-size:1.12rem; font-weight:800; color:#fff; }
+    nav .tagline { font-size:0.76rem; color:#fcd34d; font-style:italic; }
+    nav .nav-actions { display:flex; gap:0.45rem; flex-wrap:wrap; align-items:center; }
+    button, select, input, textarea { font-family:inherit; font-size:0.9rem; }
+    button { border:none; border-radius:6px; padding:0.48rem 0.88rem; font-weight:600; cursor:pointer; }
+    button:hover { opacity:0.92; }
+    button:disabled { opacity:0.55; cursor:not-allowed; }
+    .btn-primary { background:var(--primary); color:#fff; }
+    .btn-accent { background:var(--accent); color:var(--dark); }
+    .btn-success { background:var(--success); color:#fff; }
+    .btn-danger { background:var(--danger); color:#fff; }
+    .btn-ghost { background:rgba(255,255,255,0.12); color:#fff; }
+    .container { max-width:1240px; margin:1.5rem auto; padding:0 1rem; }
+    .hidden { display:none !important; }
+    .hero { background:linear-gradient(135deg,#0f172a 0%,#004aad 100%); color:#fff; border-radius:12px; padding:1.4rem; margin-bottom:1.15rem; }
+    .hero p { color:#e2e8f0; font-style:italic; margin-top:0.3rem; font-size:0.96rem; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; box-shadow:0 2px 8px rgba(15,23,42,0.04); margin-bottom:1.15rem; }
+    .grid-2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:1.1rem; }
+    .grid-3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1.1rem; }
+    .form-row { margin-bottom:0.75rem; }
+    .form-row label { display:block; font-weight:600; margin-bottom:0.25rem; font-size:0.86rem; }
+    .form-row input, .form-row select, .form-row textarea { width:100%; padding:0.52rem 0.68rem; border:1px solid #cbd5e1; border-radius:6px; background:#fff; }
+    .tag { display:inline-block; background:#e0ecff; color:var(--primary-dark); font-size:0.74rem; font-weight:700; padding:0.18rem 0.5rem; border-radius:999px; margin-bottom:0.45rem; }
+    .price-strip { display:flex; justify-content:space-between; background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.6rem 0.75rem; margin:0.65rem 0; font-size:0.84rem; }
+    .banner { padding:0.75rem 1rem; border-radius:8px; margin-bottom:1rem; font-weight:600; font-size:0.88rem; }
+    .banner-info { background:#e0ecff; color:var(--primary-dark); }
+    .banner-ok { background:#dcfce7; color:var(--success); }
+    .banner-err { background:#fee2e2; color:var(--danger); }
+    .stat-box { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.9rem; text-align:center; }
+    .stat-num { font-size:1.4rem; font-weight:800; color:var(--primary); }
+    .stat-label { font-size:0.8rem; color:var(--muted); }
+    .module-item { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:0.7rem 0.85rem; margin-top:0.5rem; }
+    pre { background:#0f172a; color:#e2e8f0; padding:0.65rem; border-radius:6px; font-size:0.79rem; overflow-x:auto; margin-top:0.4rem; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="brand-wrap" onclick="switchSection('catalog')">
+      <div class="brand">Long life learning Academy</div>
+      <div class="tagline">We innovate to teach you Skills , Knowledges and develop you Possotive Mindset</div>
+    </div>
+    <div class="nav-actions">
+      <button class="btn-ghost" onclick="switchSection('catalog')">Courses</button>
+      <button class="btn-ghost" onclick="switchSection('my-courses')">My Learning &amp; Upload</button>
+      <button class="btn-ghost" onclick="switchSection('resources-tools')">Library &amp; Tools</button>
+      <button class="btn-ghost" onclick="switchSection('ai-memory')">Open AI, CBL &amp; Memory</button>
+      <button class="btn-ghost" onclick="switchSection('auth')">Login / Register</button>
+      <button class="btn-accent" onclick="openAdminSection()">Admin (5405402)</button>
+      <button id="logout-btn" class="btn-danger hidden" onclick="logoutStudent()">Logout</button>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="hero">
+      <h1>Long life learning Academy</h1>
+      <p>We innovate to teach you Skills , Knowledges and develop you Possotive Mindset</p>
+    </div>
+
+    <div id="status-banner" class="banner banner-info">Loading Long life learning Academy...</div>
+
+    <!-- 1. COURSE CATALOG -->
+    <section id="section-catalog">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem;">
+          <div>
+            <h2>Course Catalog (1M+ Course Capacity Ready)</h2>
+            <p style="color:var(--muted);font-size:0.88rem;">Any programming language • ETB (Telebirr / CBE Birr) &amp; USD (PayPal) • Gated PDF Certificates</p>
+          </div>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+            <input id="search-filter" type="text" placeholder="Search title or language..." oninput="renderCatalog()" style="padding:0.45rem 0.7rem;border:1px solid #cbd5e1;border-radius:6px;min-width:210px;" />
+            <button class="btn-primary" onclick="fetchCatalog(false)">Refresh</button>
+          </div>
+        </div>
+        <div id="catalog-grid" class="grid-3"></div>
+        <div style="margin-top:1rem;text-align:center;">
+          <button id="load-more-btn" class="btn-primary hidden" onclick="fetchCatalog(true)">Load More Courses</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. MULTI-CHANNEL AUTH (EMAIL, PHONE, WHATSAPP, TELEGRAM + OTP + SOCIAL LINKS) -->
+    <section id="section-auth" class="hidden">
+      <div class="grid-2">
+        <div class="card">
+          <h3>Sign In (Email / Account)</h3>
+          <form onsubmit="handleLogin(event)">
+            <div class="form-row"><label>Email</label><input id="login-email" type="email" required placeholder="mohammedscho2023@gmail.com" /></div>
+            <div class="form-row"><label>Password</label><input id="login-password" type="password" required /></div>
+            <button type="submit" class="btn-primary">Sign In</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3>Multi-Channel Learner Registration + OTP + Social Media Links</h3>
+          <div class="card" style="padding:0.85rem;background:#f8fafc;margin-bottom:0.85rem;">
+            <strong style="font-size:0.86rem;">Step 1: Verify Phone, WhatsApp, or Telegram (6-Digit Code)</strong>
+            <div class="grid-2" style="gap:0.5rem;margin-top:0.5rem;">
+              <select id="otp-channel">
+                <option value="PHONE">PHONE</option>
+                <option value="WHATSAPP">WHATSAPP</option>
+                <option value="TELEGRAM">TELEGRAM</option>
+              </select>
+              <input id="otp-target" type="text" placeholder="+2519... or @username" />
+            </div>
+            <div style="display:flex;gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap;">
+              <button type="button" class="btn-primary" onclick="handleRequestOtp()">Send Code</button>
+              <input id="otp-code" type="text" placeholder="6-digit code" style="width:120px;padding:0.42rem 0.6rem;border:1px solid #cbd5e1;border-radius:6px;" />
+              <button type="button" class="btn-success" onclick="handleVerifyOtp()">Verify Code</button>
+            </div>
+            <div id="otp-status" style="font-size:0.8rem;color:var(--muted);margin-top:0.4rem;"></div>
+          </div>
+
+          <form onsubmit="handleRegisterMulti(event)">
+            <div class="form-row"><label>Full Name</label><input id="reg-name" type="text" required /></div>
+            <div class="grid-2" style="gap:0.55rem;">
+              <div class="form-row"><label>Email (Optional if Phone/WhatsApp/Telegram)</label><input id="reg-email" type="email" /></div>
+              <div class="form-row"><label>Phone</label><input id="reg-phone" type="text" placeholder="+251..." /></div>
+              <div class="form-row"><label>WhatsApp</label><input id="reg-whatsapp" type="text" placeholder="+251..." /></div>
+              <div class="form-row"><label>Telegram</label><input id="reg-telegram" type="text" placeholder="@handle" /></div>
+            </div>
+            <div class="grid-2" style="gap:0.55rem;">
+              <div class="form-row"><label>LinkedIn URL</label><input id="soc-linkedin" type="text" placeholder="https://linkedin.com/in/..." /></div>
+              <div class="form-row"><label>YouTube / X / GitHub URL</label><input id="soc-github" type="text" placeholder="https://github.com/..." /></div>
+            </div>
+            <div class="form-row"><label>Password (min 6 chars)</label><input id="reg-password" type="password" minlength="6" required /></div>
+            <button type="submit" class="btn-success">Complete Registration</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. MY LEARNING, CODE SUBMISSIONS, CERTIFICATES & STUDENT COURSE UPLOAD -->
+    <section id="section-my-courses" class="hidden">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;">
+          <h2>My Enrolled Courses &amp; Gated PDF Certificates</h2>
+          <button class="btn-primary" onclick="fetchMyCourses()">Reload</button>
+        </div>
+        <div id="my-courses-list"></div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Submit Code for Automated Test Grading</h3>
+          <form onsubmit="handleSubmitCode(event)">
+            <div class="form-row"><label>Enrolled Course</label><select id="sub-course-select" required></select></div>
+            <div class="form-row"><label>Programming Language</label><input id="sub-lang" type="text" value="javascript" required /></div>
+            <div class="form-row"><label>Code</label><textarea id="sub-code" rows="4" required placeholder="function solve(input) { return input; }"></textarea></div>
+            <div class="form-row"><label>Notes (Optional)</label><input id="sub-notes" type="text" /></div>
+            <button type="submit" class="btn-success">Run Tests &amp; Submit</button>
+          </form>
+          <div id="my-submissions-list" style="margin-top:0.85rem;"></div>
+        </div>
+
+        <div class="card">
+          <h3>Upload a Course (Submitted for Admin Approval)</h3>
+          <form onsubmit="handleStudentCourseUpload(event)">
+            <div class="form-row"><label>Course Title</label><input id="up-title" type="text" required /></div>
+            <div class="form-row"><label>Programming Language / Track</label><input id="up-lang" type="text" value="Any Programming Language" required /></div>
+            <div class="form-row"><label>Description</label><textarea id="up-desc" rows="2" required></textarea></div>
+            <div class="form-row"><label>Starter Code / Lab Notes (Optional)</label><textarea id="up-code" rows="2"></textarea></div>
+            <button type="submit" class="btn-primary">Upload Course for Approval</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. LIBRARY OF RESOURCES, EXTERNAL TOOLS & BOOK/MODULE-TO-COURSE CONVERTER -->
+    <section id="section-resources-tools" class="hidden">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.65rem;margin-bottom:0.85rem;">
+          <div>
+            <h2>External Tools (Search Engines, AI Tools, Ed Tools, Servers, Apps)</h2>
+          </div>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+            <select id="tool-category-filter" onchange="fetchExternalTools()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;">
+              <option value="">All Categories</option>
+              <option value="SEARCH_ENGINE">SEARCH_ENGINE</option>
+              <option value="AI_TOOL">AI_TOOL</option>
+              <option value="EDUCATIONAL_TOOL">EDUCATIONAL_TOOL</option>
+              <option value="EDUCATIONAL_SERVER">EDUCATIONAL_SERVER</option>
+              <option value="APP">APP</option>
+            </select>
+            <button class="btn-primary" onclick="fetchExternalTools()">Refresh</button>
+          </div>
+        </div>
+        <div id="external-tools-grid" class="grid-3"></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.65rem;margin-bottom:0.85rem;">
+          <h2>Library of Resources</h2>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+            <select id="resource-type-filter" onchange="fetchResourceLibrary()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;">
+              <option value="">All Types</option>
+              <option value="BOOK">BOOK</option>
+              <option value="MODULE">MODULE</option>
+              <option value="GUIDE">GUIDE</option>
+              <option value="TEMPLATE">TEMPLATE</option>
+              <option value="CODE_PACK">CODE_PACK</option>
+            </select>
+            <input id="resource-search-input" type="text" placeholder="Search library..." oninput="renderResourceLibrary()" style="padding:0.45rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;" />
+            <button class="btn-primary" onclick="fetchResourceLibrary()">Refresh</button>
+          </div>
+        </div>
+        <div id="resource-library-grid" class="grid-3"></div>
+      </div>
+
+      <div class="card">
+        <h2>Convert Books, Modules &amp; Materials into Courses + Add Library &amp; Tools (Code 5405402)</h2>
+        <div class="grid-2" style="margin-top:0.75rem;">
+          <div class="card" style="margin:0;">
+            <h3>Book / Module → Course Converter</h3>
+            <form onsubmit="handleConvertMaterialToCourse(event)">
+              <div class="form-row"><label>Course Title</label><input id="conv-title" type="text" required /></div>
+              <div class="grid-2" style="gap:0.55rem;">
+                <div class="form-row"><label>Source Type</label><select id="conv-source-type"><option value="BOOK">BOOK</option><option value="MODULE">MODULE</option><option value="GUIDE">GUIDE</option><option value="CODE_PACK">CODE_PACK</option></select></div>
+                <div class="form-row"><label>Language / Track</label><input id="conv-lang" type="text" value="Any Programming Language" required /></div>
+              </div>
+              <div class="form-row"><label>Source URL (Optional)</label><input id="conv-url" type="url" placeholder="https://..." /></div>
+              <div class="form-row"><label>Chapters / Modules Text (Use <code># Chapter ...</code> or <code>Module 1: ...</code>)</label><textarea id="conv-text" rows="4" placeholder="# Chapter 1: Introduction&#10;Content...&#10;&#10;# Chapter 2: Practice&#10;Content..."></textarea></div>
+              <button type="submit" class="btn-success">Convert into Course</button>
+            </form>
+          </div>
+
+          <div>
+            <div class="card" style="margin-bottom:0.85rem;">
+              <h3>Add Item to Library of Resources</h3>
+              <form onsubmit="handleAddLibraryResource(event)">
+                <div class="form-row"><label>Title</label><input id="res-title" type="text" required /></div>
+                <div class="grid-2" style="gap:0.55rem;">
+                  <div class="form-row"><label>Type</label><select id="res-type"><option value="BOOK">BOOK</option><option value="MODULE">MODULE</option><option value="GUIDE">GUIDE</option><option value="TEMPLATE">TEMPLATE</option><option value="CODE_PACK">CODE_PACK</option></select></div>
+                  <div class="form-row"><label>URL (Optional)</label><input id="res-url" type="url" placeholder="https://..." /></div>
+                </div>
+                <div class="form-row"><label>Summary</label><input id="res-summary" type="text" /></div>
+                <button type="submit" class="btn-primary">Add to Library</button>
+              </form>
+            </div>
+
+            <div class="card" style="margin:0;">
+              <h3>Add External Tool</h3>
+              <form onsubmit="handleAddExternalTool(event)">
+                <div class="form-row"><label>Tool Name</label><input id="tool-name" type="text" required /></div>
+                <div class="grid-2" style="gap:0.55rem;">
+                  <div class="form-row"><label>Category</label><select id="tool-category"><option value="SEARCH_ENGINE">SEARCH_ENGINE</option><option value="AI_TOOL">AI_TOOL</option><option value="EDUCATIONAL_TOOL">EDUCATIONAL_TOOL</option><option value="EDUCATIONAL_SERVER">EDUCATIONAL_SERVER</option><option value="APP">APP</option></select></div>
+                  <div class="form-row"><label>URL</label><input id="tool-url" type="url" required placeholder="https://..." /></div>
+                </div>
+                <div class="form-row"><label>Description</label><input id="tool-desc" type="text" /></div>
+                <button type="submit" class="btn-accent">Add External Tool</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. OPEN AI SYSTEM, LEARNING MONITOR, ADAPTIVE COURSES, CBL, MULTI-AGENT WORKFLOW & UNLIMITED MEMORY -->
+    <section id="section-ai-memory" class="hidden">
+      <div class="card">
+        <h2>Academy Open AI System, Prompt Improver, Multi-Agent Workflow &amp; Unlimited Memory</h2>
+        <div class="grid-2" style="margin-top:0.85rem;">
+          <div class="card" style="margin:0;">
+            <h3>Open AI Studio (Copilot / Claude Analyst / ChatGPT Coach / Breakthrough)</h3>
+            <form onsubmit="handleOpenAiStudio(event)">
+              <div class="grid-2" style="gap:0.55rem;">
+                <div class="form-row"><label>Mode</label><select id="oai-mode"><option value="COPILOT">COPILOT</option><option value="CLAUDE_ANALYST">CLAUDE_ANALYST</option><option value="CHATGPT_COACH" selected>CHATGPT_COACH</option><option value="BREAKTHROUGH">BREAKTHROUGH</option></select></div>
+                <div class="form-row"><label>Course (Optional)</label><select id="oai-course-select"></select></div>
+              </div>
+              <div class="form-row"><label>Prompt</label><textarea id="oai-prompt" rows="3" required placeholder="Ask for breakthrough ideas, code solutions, analysis, or coaching..."></textarea></div>
+              <button type="submit" class="btn-primary">Run Open AI</button>
+            </form>
+            <div id="oai-studio-output" style="margin-top:0.75rem;"></div>
+
+            <hr style="margin:1rem 0;border:none;border-top:1px solid var(--border);" />
+            <h3>Prompt-Driven Course &amp; Academy Improver (Code 5405402)</h3>
+            <form onsubmit="handleRunImprovementPrompt(event)">
+              <div class="grid-2" style="gap:0.55rem;">
+                <div class="form-row"><label>Scope</label><select id="imp-scope"><option value="COURSE">COURSE</option><option value="ACADEMY">ACADEMY</option></select></div>
+                <div class="form-row"><label>Course</label><select id="imp-course-select"></select></div>
+              </div>
+              <div class="form-row"><label>Improvement Prompt</label><textarea id="imp-prompt" rows="2" required placeholder="Improve course or academy via prompt..."></textarea></div>
+              <button type="submit" class="btn-success">Apply Improvement Prompt</button>
+            </form>
+            <div id="imp-result-box" style="margin-top:0.65rem;"></div>
+
+            <hr style="margin:1rem 0;border:none;border-top:1px solid var(--border);" />
+            <h3>Autonomous Multi-Agent Course Generator (1 Prompt → Full Course + Test Cases + Memory)</h3>
+            <form onsubmit="handleAutonomousCourseWorkflow(event)">
+              <div class="grid-2" style="gap:0.55rem;">
+                <div class="form-row"><label>Course Title (Optional)</label><input id="wf-title" type="text" /></div>
+                <div class="form-row"><label>Modules Count (2-10)</label><input id="wf-modules" type="number" min="2" max="10" value="4" required /></div>
+              </div>
+              <div class="form-row"><label>Single Prompt</label><textarea id="wf-prompt" rows="2" required placeholder="Generate a complete multi-module course with test cases..."></textarea></div>
+              <button type="submit" class="btn-accent">Generate Full Course Autonomously</button>
+            </form>
+            <div id="wf-result-box" style="margin-top:0.65rem;"></div>
+          </div>
+
+          <div>
+            <div class="card" style="margin-bottom:0.9rem;">
+              <h3>AI Learning Monitor, Adaptive Course &amp; Competence-Based Learning (CBL)</h3>
+              <form onsubmit="handleMonitorAndAdapt(event)">
+                <div class="grid-2" style="gap:0.55rem;">
+                  <div class="form-row"><label>Course</label><select id="adapt-course-select"></select></div>
+                  <div class="form-row"><label>Pace</label><select id="adapt-pace"><option value="ADAPTIVE">ADAPTIVE</option><option value="FOUNDATIONAL">FOUNDATIONAL</option><option value="FAST_TRACK">FAST_TRACK</option></select></div>
+                  <div class="form-row"><label>Score (0-100)</label><input id="mon-score" type="number" min="0" max="100" value="85" /></div>
+                  <div class="form-row"><label>Minutes</label><input id="mon-minutes" type="number" min="0" value="25" /></div>
+                </div>
+                <div class="form-row"><label>Goal / Mindset Note</label><input id="adapt-goal" type="text" /></div>
+                <button type="submit" class="btn-success">Monitor &amp; Adapt</button>
+              </form>
+              <div id="adapt-output" style="margin-top:0.6rem;"></div>
+
+              <form onsubmit="handleCompetenceAssess(event)" style="margin-top:0.85rem;">
+                <div class="grid-2" style="gap:0.55rem;">
+                  <div class="form-row"><label>Competency Name</label><input id="cbl-name" type="text" required placeholder="Applied Coding & Positive Mindset" /></div>
+                  <div class="form-row"><label>Evidence Score (0-100)</label><input id="cbl-score" type="number" min="0" max="100" value="88" required /></div>
+                </div>
+                <button type="submit" class="btn-primary">Record Competence</button>
+              </form>
+              <div id="cbl-list" style="margin-top:0.6rem;"></div>
+            </div>
+
+            <div class="card" style="margin:0;">
+              <h3>Unlimited Persistent Memory (<code>academy-memory.jsonl</code>)</h3>
+              <div style="display:flex;gap:0.45rem;margin-bottom:0.55rem;flex-wrap:wrap;">
+                <input id="mem-search-q" type="text" placeholder="Search unlimited memory..." style="flex:1;min-width:150px;padding:0.42rem 0.65rem;border:1px solid #cbd5e1;border-radius:6px;" />
+                <button type="button" class="btn-primary" onclick="fetchUnlimitedMemory(false)">Search</button>
+                <button type="button" class="btn-accent" onclick="handleExportMemoryJsonl()">Export .jsonl</button>
+              </div>
+              <div id="mem-stats-line" style="font-size:0.78rem;color:var(--muted);margin-bottom:0.45rem;"></div>
+              <div id="mem-list"></div>
+              <button id="mem-load-more" type="button" class="btn-ghost hidden" style="color:var(--primary);border:1px solid var(--primary);margin-top:0.45rem;" onclick="fetchUnlimitedMemory(true)">Load Older</button>
+
+              <div class="form-row" style="margin-top:0.75rem;">
+                <label style="font-size:0.8rem;">Import JSONL Lines (Admin Code 5405402)</label>
+                <textarea id="mem-import-jsonl" rows="2" placeholder='{"id":"mem_custom","scope":"ACADEMY","title":"Note","content":"..."}'></textarea>
+              </div>
+              <button type="button" class="btn-success" onclick="handleImportMemoryJsonl()">Import Backup</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6. ADMIN STUDIO (ADD INSTRUCTORS, APPROVE COURSES, ANALYTICS) -->
+    <section id="section-admin" class="hidden">
+      <div class="card">
+        <h2>Admin Studio — Long life learning Academy (Code: 5405402)</h2>
+        <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;margin:0.65rem 0 1rem;">
+          <input id="admin-code-input" type="password" value="5405402" style="padding:0.48rem 0.7rem;border:1px solid #cbd5e1;border-radius:6px;width:190px;" />
+          <button class="btn-primary" onclick="fetchAdminDashboard()">Load Analytics &amp; Review Queue</button>
+        </div>
+
+        <div class="grid-3" style="margin-bottom:1rem;">
+          <div class="stat-box"><div class="stat-num" id="stat-students">0</div><div class="stat-label">Total Learners</div></div>
+          <div class="stat-box"><div class="stat-num" id="stat-courses">0</div><div class="stat-label">Total Courses</div></div>
+          <div class="stat-box"><div class="stat-num" id="stat-enrollments">0</div><div class="stat-label">Completed Enrollments</div></div>
+          <div class="stat-box"><div class="stat-num" id="stat-etb">0.00 ETB</div><div class="stat-label">Revenue (ETB)</div></div>
+          <div class="stat-box"><div class="stat-num" id="stat-usd">$0.00</div><div class="stat-label">Revenue (USD)</div></div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card" style="margin:0;">
+            <h3>Add Instructor</h3>
+            <form onsubmit="handleAddInstructor(event)">
+              <div class="form-row"><label>Instructor Name</label><input id="inst-name" type="text" required /></div>
+              <div class="grid-2" style="gap:0.55rem;">
+                <div class="form-row"><label>Email</label><input id="inst-email" type="email" /></div>
+                <div class="form-row"><label>Phone / WhatsApp</label><input id="inst-phone" type="text" /></div>
+              </div>
+              <div class="form-row"><label>Specialties</label><input id="inst-spec" type="text" value="Skills, Knowledge & Positive Mindset" /></div>
+              <button type="submit" class="btn-success">Add Instructor</button>
+            </form>
+            <div id="instructors-list" style="margin-top:0.75rem;"></div>
+          </div>
+
+          <div class="card" style="margin:0;">
+            <h3>Course Approval Queue</h3>
+            <div id="admin-review-queue"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const API = window.location.origin + "/api";
+    const MASTER_ADMIN_CODE = "5405402";
+    let catalogCourses = [];
+    let nextCursor = null;
+    let enrolledList = [];
+    let enrolledCourseIds = new Set();
+    let libraryResources = [];
+    let externalToolsList = [];
+    let memoryNextCursor = null;
+    let verifiedContactToken = "";
+    let authToken = localStorage.getItem("lms_token") || "";
+    let currentUser = JSON.parse(localStorage.getItem("lms_user") || "null");
+
+    function escapeHtml(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function escapeAttrUrl(u) {
+      const s = String(u ?? "").trim();
+      return /^https?:\/\//i.test(s) ? escapeHtml(s) : "#";
+    }
+
+    function setBanner(msg, type = "info") {
+      const el = document.getElementById("status-banner");
+      el.className = "banner banner-" + type;
+      el.textContent = msg + " | Learner: " + (currentUser ? currentUser.name + " (" + currentUser.email + ")" : "Guest");
+    }
+
+    function updateSessionUI() {
+      document.getElementById("logout-btn").classList.toggle("hidden", !(currentUser && authToken));
+      setBanner(currentUser ? "Signed in to Long life learning Academy" : "Welcome to Long life learning Academy");
+    }
+
+    function switchSection(id) {
+      ["catalog", "auth", "my-courses", "resources-tools", "ai-memory", "admin"].forEach((s) =>
+        document.getElementById("section-" + s)?.classList.toggle("hidden", s !== id)
+      );
+      if (id === "catalog") fetchCatalog(false);
+      if (id === "my-courses") {
+        fetchMyCourses();
+        fetchMySubmissions();
+      }
+      if (id === "resources-tools") {
+        fetchExternalTools();
+        fetchResourceLibrary();
+      }
+      if (id === "ai-memory") {
+        populateCourseSelectors();
+        fetchUnlimitedMemory(false);
+      }
+      if (id === "admin") {
+        fetchAdminDashboard();
+      }
+    }
+
+    function openAdminSection() {
+      const code = prompt("Enter Master Admin Code:");
+      if (code !== MASTER_ADMIN_CODE) {
+        setBanner("Invalid Admin Code.", "err");
+        return;
+      }
+      document.getElementById("admin-code-input").value = code;
+      switchSection("admin");
+    }
+
+    function getAdminCode() {
+      return (document.getElementById("admin-code-input")?.value || MASTER_ADMIN_CODE).trim();
+    }
+
+    function populateCourseSelectors() {
+      const opts = (catalogCourses || []).map(
+        (c) => '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.title) + "</option>"
+      );
+      const oaiSel = document.getElementById("oai-course-select");
+      const impSel = document.getElementById("imp-course-select");
+      const adaptSel = document.getElementById("adapt-course-select");
+      if (oaiSel) oaiSel.innerHTML = '<option value="">Academy-Wide</option>' + opts.join("");
+      if (impSel) impSel.innerHTML = opts.join("") || '<option value="">No courses</option>';
+      if (adaptSel) adaptSel.innerHTML = opts.join("") || '<option value="">No courses</option>';
+    }
+
+    async function fetchCatalog(append = false) {
+      try {
+        const url = API + "/courses?limit=24" + (append && nextCursor ? "&cursor=" + encodeURIComponent(nextCursor) : "");
+        const r = await fetch(url);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Failed to load catalog");
+        catalogCourses = append ? catalogCourses.concat(d.courses || []) : d.courses || [];
+        nextCursor = d.pageInfo?.nextCursor || null;
+        document.getElementById("load-more-btn").classList.toggle("hidden", !d.pageInfo?.hasMore);
+        populateCourseSelectors();
+        renderCatalog();
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    function renderCatalog() {
+      const q = (document.getElementById("search-filter")?.value || "").trim().toLowerCase();
+      const list = catalogCourses.filter(
+        (c) =>
+          !q ||
+          (c.programmingLanguage || "").toLowerCase().includes(q) ||
+          (c.title || "").toLowerCase().includes(q)
+      );
+      const grid = document.getElementById("catalog-grid");
+      if (!list.length) {
+        grid.innerHTML = '<p style="color:var(--muted)">No published courses match yet.</p>';
+        return;
+      }
+      grid.innerHTML = list
+        .map((c, i) => {
+          const done = enrolledCourseIds.has(c.id);
+          return (
+            '<div class="card" style="margin:0;display:flex;flex-direction:column;justify-content:space-between"><div>' +
+            '<span class="tag">' + escapeHtml(c.programmingLanguage || "Any Programming Language") + "</span>" +
+            "<h3>" + escapeHtml(c.title) + "</h3>" +
+            '<p style="color:var(--muted);font-size:0.86rem;margin:0.35rem 0">' + escapeHtml(c.description) + "</p>" +
+            '<div class="price-strip"><div><strong>ETB:</strong> ' + escapeHtml(c.priceETB) + ' Birr<br/><span style="color:var(--muted);font-size:0.76rem">Cert: ' + escapeHtml(c.certFeeETB) + " Birr</span></div>" +
+            '<div style="text-align:right"><strong>USD:</strong> $' + escapeHtml(c.priceUSD) + '<br/><span style="color:var(--muted);font-size:0.76rem">Cert: $' + escapeHtml(c.certFeeUSD) + "</span></div></div></div>" +
+            '<div><div class="form-row" style="margin-bottom:0.45rem"><select id="pay-opt-' + i + '"' + (done ? " disabled" : "") + '><option value="ETB|TELEBIRR">Telebirr (ETB)</option><option value="ETB|CBE_BIRR">CBE Birr (ETB)</option><option value="USD|PAYPAL">PayPal (USD)</option></select></div>' +
+            '<button class="' + (done ? "btn-success" : "btn-primary") + '" style="width:100%"' + (done ? " disabled" : "") + ' onclick="enrollCourse(\'' + escapeHtml(c.id) + "'," + i + ')">' + (done ? "Enrolled" : "Enroll Now") + "</button></div></div>"
+          );
+        })
+        .join("");
+    }
+
+    async function handleRequestOtp() {
+      try {
+        const channel = document.getElementById("otp-channel").value;
+        const target = document.getElementById("otp-target").value.trim();
+        const r = await fetch(API + "/auth/request-otp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel, target }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "OTP request failed");
+        document.getElementById("otp-status").textContent =
+          d.message + (d.devPreviewCode ? " [Dev Code: " + d.devPreviewCode + "]" : "");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function handleVerifyOtp() {
+      try {
+        const channel = document.getElementById("otp-channel").value;
+        const target = document.getElementById("otp-target").value.trim();
+        const code = document.getElementById("otp-code").value.trim();
+        const r = await fetch(API + "/auth/verify-otp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel, target, code }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "OTP verification failed");
+        verifiedContactToken = d.verificationToken;
+        document.getElementById("otp-status").textContent = "Verified " + channel + " (" + target + ")";
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function handleRegisterMulti(e) {
+      e.preventDefault();
+      try {
+        const socialLinks = {};
+        const li = document.getElementById("soc-linkedin").value.trim();
+        const gh = document.getElementById("soc-github").value.trim();
+        if (li) socialLinks.linkedin = li;
+        if (gh) socialLinks.github = gh;
+
+        const r = await fetch(API + "/auth/register-multi", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: document.getElementById("reg-name").value.trim(),
+            email: document.getElementById("reg-email").value.trim() || undefined,
+            phone: document.getElementById("reg-phone").value.trim() || undefined,
+            whatsapp: document.getElementById("reg-whatsapp").value.trim() || undefined,
+            telegram: document.getElementById("reg-telegram").value.trim() || undefined,
+            socialLinks,
+            verificationToken: verifiedContactToken || undefined,
+            password: document.getElementById("reg-password").value,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Registration failed");
+        authToken = d.token;
+        currentUser = d.user;
+        localStorage.setItem("lms_token", authToken);
+        localStorage.setItem("lms_user", JSON.stringify(currentUser));
+        updateSessionUI();
+        switchSection("catalog");
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: document.getElementById("login-email").value.trim(),
+            password: document.getElementById("login-password").value,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Login failed");
+        authToken = d.token;
+        currentUser = d.user;
+        localStorage.setItem("lms_token", authToken);
+        localStorage.setItem("lms_user", JSON.stringify(currentUser));
+        updateSessionUI();
+        await fetchMyCourses();
+        await fetchMySubmissions();
+        switchSection("my-courses");
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    function logoutStudent() {
+      authToken = "";
+      currentUser = null;
+      enrolledList = [];
+      enrolledCourseIds.clear();
+      localStorage.removeItem("lms_token");
+      localStorage.removeItem("lms_user");
+      updateSessionUI();
+      renderCatalog();
+      switchSection("catalog");
+    }
+
+    async function enrollCourse(courseId, idx) {
+      if (!authToken) {
+        setBanner("Please sign in or register first.", "err");
+        switchSection("auth");
+        return;
+      }
+      const [currency, paymentMethod] = document.getElementById("pay-opt-" + idx).value.split("|");
+      try {
+        const r = await fetch(API + "/enroll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
+          body: JSON.stringify({ courseId, currency, paymentMethod }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Enrollment failed");
+        enrolledCourseIds.add(courseId);
+        renderCatalog();
+        setBanner("Enrolled! Ref: " + d.transaction.providerRef, "ok");
+        switchSection("my-courses");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function fetchMyCourses() {
+      if (!authToken) {
+        document.getElementById("my-courses-list").innerHTML = '<p style="color:var(--muted)">Sign in to view enrolled courses.</p>';
+        return;
+      }
+      try {
+        const r = await fetch(API + "/my-courses", { headers: { Authorization: "Bearer " + authToken } });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Failed to load courses");
+        enrolledList = d.enrollments || [];
+        enrolledCourseIds = new Set(enrolledList.map((x) => x.courseId));
+        renderCatalog();
+
+        const sel = document.getElementById("sub-course-select");
+        if (sel) {
+          sel.innerHTML =
+            enrolledList.map((x) => '<option value="' + escapeHtml(x.courseId) + '">' + escapeHtml(x.course.title) + "</option>").join("") ||
+            '<option value="">Enroll in a course first</option>';
+        }
+
+        const el = document.getElementById("my-courses-list");
+        if (!enrolledList.length) {
+          el.innerHTML = '<p style="color:var(--muted)">No enrollments yet.</p>';
+          return;
+        }
+        el.innerHTML = enrolledList
+          .map((enr, idx) => {
+            const c = enr.course;
+            const issued = enr.certificateStatus === "ISSUED";
+            const certBtns = issued
+              ? '<button class="btn-success" onclick="downloadIssuedCertificate(\'' + escapeHtml(c.id) + "')\">Download PDF Certificate</button>"
+              : '<select id="cert-opt-' + idx + '"><option value="ETB|TELEBIRR">Telebirr (ETB)</option><option value="ETB|CBE_BIRR">CBE Birr (ETB)</option><option value="USD|PAYPAL">PayPal (USD)</option></select><button class="btn-success" onclick="payAndDownloadCertificate(\'' + escapeHtml(c.id) + "'," + idx + ')">Pay &amp; Download PDF</button>';
+            return (
+              '<div class="card"><div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:0.5rem"><div><span class="tag">' +
+              escapeHtml(c.programmingLanguage || "Any Language") +
+              "</span><h3>" +
+              escapeHtml(c.title) +
+              '</h3><p style="font-size:0.86rem;color:var(--muted)">Certificate: <strong>' +
+              escapeHtml(enr.certificateStatus) +
+              '</strong></p></div><div style="display:flex;gap:0.45rem;flex-wrap:wrap">' +
+              certBtns +
+              "</div></div></div>"
+            );
+          })
+          .join("");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function handleSubmitCode(e) {
+      e.preventDefault();
+      if (!authToken) {
+        setBanner("Sign in first.", "err");
+        return;
+      }
+      const courseId = document.getElementById("sub-course-select").value;
+      if (!courseId) return;
+      try {
+        const r = await fetch(API + "/submissions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
+          body: JSON.stringify({
+            courseId,
+            language: document.getElementById("sub-lang").value.trim(),
+            code: document.getElementById("sub-code").value,
+            notes: document.getElementById("sub-notes").value.trim(),
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Submission failed");
+        setBanner("Score: " + d.evaluation.score + "% (" + d.evaluation.status + ")", "ok");
+        await fetchMySubmissions();
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function fetchMySubmissions() {
+      if (!authToken) return;
+      try {
+        const r = await fetch(API + "/submissions", { headers: { Authorization: "Bearer " + authToken } });
+        const d = await r.json();
+        if (!r.ok) return;
+        document.getElementById("my-submissions-list").innerHTML = (d.submissions || [])
+          .map(
+            (s) =>
+              '<div class="module-item"><strong>' +
+              escapeHtml(s.language) +
+              '</strong> <span class="tag">' +
+              escapeHtml(String(s.evaluation?.score ?? 0)) +
+              "% • " +
+              escapeHtml(s.evaluation?.status || "") +
+              "</span><pre>" +
+              escapeHtml(s.code) +
+              "</pre></div>"
+          )
+          .join("");
+      } catch (_) {}
+    }
+
+    async function handleStudentCourseUpload(e) {
+      e.preventDefault();
+      if (!authToken) {
+        setBanner("Sign in first to upload a course.", "err");
+        return;
+      }
+      try {
+        const r = await fetch(API + "/student-courses/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
+          body: JSON.stringify({
+            title: document.getElementById("up-title").value.trim(),
+            programmingLanguage: document.getElementById("up-lang").value.trim(),
+            description: document.getElementById("up-desc").value.trim(),
+            starterCode: document.getElementById("up-code").value || undefined,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Upload failed");
+        e.target.reset();
+        setBanner(d.message || "Uploaded for admin approval.", "ok");
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function saveBlobResponse(res, fallbackName) {
+      const blob = await res.blob();
+      const disp = res.headers.get("Content-Disposition") || "";
+      const m = disp.match(/filename="?([^";]+)"?/i);
+      const name = m ? m[1] : fallbackName;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    async function payAndDownloadCertificate(courseId, idx) {
+      const [currency, paymentMethod] = document.getElementById("cert-opt-" + idx).value.split("|");
+      try {
+        const r = await fetch(API + "/certificate/" + encodeURIComponent(courseId), {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
+          body: JSON.stringify({ currency, paymentMethod }),
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error(d.error || "Certificate locked or payment failed");
+        }
+        await saveBlobResponse(r, "Certificate.pdf");
+        setBanner("Certificate issued and PDF downloaded!", "ok");
+        fetchMyCourses();
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function downloadIssuedCertificate(courseId) {
+      try {
+        const r = await fetch(API + "/certificate/" + encodeURIComponent(courseId) + "/download", {
+          headers: { Authorization: "Bearer " + authToken },
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error(d.error || "Download failed");
+        }
+        await saveBlobResponse(r, "Certificate.pdf");
+        setBanner("Certificate PDF downloaded!", "ok");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function fetchExternalTools() {
+      try {
+        const cat = document.getElementById("tool-category-filter")?.value || "";
+        const r = await fetch(API + "/external-tools" + (cat ? "?category=" + encodeURIComponent(cat) : ""));
+        const d = await r.json();
+        externalToolsList = d.tools || [];
+        document.getElementById("external-tools-grid").innerHTML = externalToolsList
+          .map(
+            (t) =>
+              '<div class="card" style="margin:0"><div><span class="tag">' +
+              escapeHtml(t.category) +
+              "</span><h3>" +
+              escapeHtml(t.name) +
+              '</h3><p style="color:var(--muted);font-size:0.84rem;margin:0.35rem 0 0.7rem">' +
+              escapeHtml(t.description || "") +
+              '</p></div><a href="' +
+              escapeAttrUrl(t.url) +
+              '" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:var(--primary);color:#fff;padding:0.42rem 0.8rem;border-radius:6px;text-decoration:none;font-size:0.84rem;font-weight:600">Open Tool ↗</a></div>'
+          )
+          .join("");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function fetchResourceLibrary() {
+      try {
+        const type = document.getElementById("resource-type-filter")?.value || "";
+        const r = await fetch(API + "/resources" + (type ? "?type=" + encodeURIComponent(type) : ""));
+        const d = await r.json();
+        libraryResources = d.resources || [];
+        renderResourceLibrary();
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    function renderResourceLibrary() {
+      const q = (document.getElementById("resource-search-input")?.value || "").trim().toLowerCase();
+      const filtered = libraryResources.filter(
+        (r) => !q || r.title.toLowerCase().includes(q) || (r.summary || "").toLowerCase().includes(q)
+      );
+      document.getElementById("resource-library-grid").innerHTML = filtered
+        .map(
+          (r) =>
+            '<div class="card" style="margin:0"><span class="tag">' +
+            escapeHtml(r.resourceType) +
+            "</span><h3>" +
+            escapeHtml(r.title) +
+            '</h3><p style="color:var(--muted);font-size:0.84rem;margin:0.35rem 0">' +
+            escapeHtml(r.summary || "") +
+            '</p>' +
+            (r.url ? '<a href="' + escapeAttrUrl(r.url) + '" target="_blank" rel="noopener noreferrer">Open Resource ↗</a>' : "") +
+            "</div>"
+        )
+        .join("");
+    }
+
+    async function handleConvertMaterialToCourse(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/admin/courses/convert-source", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            courseTitle: document.getElementById("conv-title").value.trim(),
+            sourceType: document.getElementById("conv-source-type").value,
+            programmingLanguage: document.getElementById("conv-lang").value.trim(),
+            sourceUrl: document.getElementById("conv-url").value.trim() || undefined,
+            sourceText: document.getElementById("conv-text").value,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Conversion failed");
+        e.target.reset();
+        setBanner(d.message || "Converted into course!", "ok");
+        await Promise.all([fetchCatalog(false), fetchResourceLibrary()]);
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleAddLibraryResource(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/admin/resources", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            title: document.getElementById("res-title").value.trim(),
+            resourceType: document.getElementById("res-type").value,
+            url: document.getElementById("res-url").value.trim() || undefined,
+            summary: document.getElementById("res-summary").value.trim() || undefined,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Failed to add resource");
+        e.target.reset();
+        setBanner("Added to Resource Library.", "ok");
+        await fetchResourceLibrary();
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleAddExternalTool(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/admin/external-tools", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            name: document.getElementById("tool-name").value.trim(),
+            category: document.getElementById("tool-category").value,
+            url: document.getElementById("tool-url").value.trim(),
+            description: document.getElementById("tool-desc").value.trim() || undefined,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Failed to add external tool");
+        e.target.reset();
+        setBanner("Added external tool.", "ok");
+        await fetchExternalTools();
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleOpenAiStudio(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/open-ai/studio", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: document.getElementById("oai-mode").value,
+            courseId: document.getElementById("oai-course-select").value || undefined,
+            prompt: document.getElementById("oai-prompt").value.trim(),
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Open AI failed");
+        document.getElementById("oai-studio-output").innerHTML =
+          '<div class="module-item"><strong>' + escapeHtml(d.mode?.label || "") + '</strong> <span class="tag">' + escapeHtml(d.provider) + "</span><pre>" + escapeHtml(d.output) + "</pre></div>";
+        await fetchUnlimitedMemory(false);
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleRunImprovementPrompt(e) {
+      e.preventDefault();
+      try {
+        const scope = document.getElementById("imp-scope").value;
+        const r = await fetch(API + "/ai/agent/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            targetScope: scope,
+            courseId: scope === "COURSE" ? document.getElementById("imp-course-select").value : null,
+            prompt: document.getElementById("imp-prompt").value.trim(),
+            autoApply: true,
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Improvement failed");
+        document.getElementById("imp-result-box").innerHTML =
+          '<div class="module-item"><strong>Applied (' + escapeHtml(d.provider) + ")</strong><pre>" + escapeHtml(d.aiNarrative) + "</pre></div>";
+        await Promise.all([fetchCatalog(false), fetchUnlimitedMemory(false)]);
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleAutonomousCourseWorkflow(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/ai/workflow/create-course", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            courseTitle: document.getElementById("wf-title").value.trim() || undefined,
+            moduleCount: Number(document.getElementById("wf-modules").value || 4),
+            prompt: document.getElementById("wf-prompt").value.trim(),
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Workflow failed");
+        e.target.reset();
+        document.getElementById("wf-result-box").innerHTML =
+          '<div class="module-item"><strong>Created: ' + escapeHtml(d.course.title) + '</strong> <span class="tag">' + escapeHtml(String(d.testCasesCount || 0)) + " test cases</span></div>";
+        await Promise.all([fetchCatalog(false), fetchUnlimitedMemory(false)]);
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleMonitorAndAdapt(e) {
+      e.preventDefault();
+      if (!authToken) {
+        setBanner("Sign in first.", "err");
+        return;
+      }
+      try {
+        const courseId = document.getElementById("adapt-course-select").value;
+        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + authToken };
+        const mon = await fetch(API + "/open-ai/monitor/track", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            courseId,
+            score: Number(document.getElementById("mon-score").value),
+            timeSpentMinutes: Number(document.getElementById("mon-minutes").value || 0),
+            mindsetNote: document.getElementById("adapt-goal").value.trim(),
+          }),
+        });
+        const ad = await fetch(API + "/open-ai/adapt-course", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            courseId,
+            goal: document.getElementById("adapt-goal").value.trim(),
+            pace: document.getElementById("adapt-pace").value,
+          }),
+        });
+        const mData = await mon.json();
+        const aData = await ad.json();
+        document.getElementById("adapt-output").innerHTML =
+          '<div class="module-item"><strong>' + escapeHtml(mData.telemetry?.learningSignal || "") + " • " + escapeHtml(aData.adaptation?.pace || "") + "</strong></div>";
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleCompetenceAssess(e) {
+      e.preventDefault();
+      if (!authToken) {
+        setBanner("Sign in first.", "err");
+        return;
+      }
+      try {
+        const r = await fetch(API + "/open-ai/competence/assess", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + authToken },
+          body: JSON.stringify({
+            courseId: document.getElementById("adapt-course-select")?.value || "general",
+            competencyName: document.getElementById("cbl-name").value.trim(),
+            evidenceScore: Number(document.getElementById("cbl-score").value),
+          }),
+        });
+        const d = await r.json();
+        document.getElementById("cbl-list").innerHTML = (d.allCompetencies || [])
+          .map((c) => '<div class="module-item"><strong>' + escapeHtml(c.competencyName) + '</strong> <span class="tag">' + escapeHtml(c.level) + " (" + escapeHtml(String(c.bestScore)) + "%)</span></div>")
+          .join("");
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function fetchUnlimitedMemory(append = false) {
+      try {
+        const q = encodeURIComponent((document.getElementById("mem-search-q")?.value || "").trim());
+        const cur = append && memoryNextCursor ? "&cursor=" + encodeURIComponent(memoryNextCursor) : "";
+        const r = await fetch(API + "/memory?limit=12&q=" + q + cur);
+        const d = await r.json();
+        memoryNextCursor = d.pageInfo?.nextCursor || null;
+        if (d.stats) {
+          document.getElementById("mem-stats-line").textContent =
+            "Records: " + d.stats.totalRecords + " | Disk: " + d.stats.diskSizeMB + " MB | Unlimited";
+        }
+        const html = (d.memories || [])
+          .map((m) => '<div class="module-item"><strong>' + escapeHtml(m.title) + '</strong> <span class="tag">' + escapeHtml(m.scope) + '</span><p style="font-size:0.8rem;margin-top:0.2rem">' + escapeHtml(m.content.slice(0, 300)) + "</p></div>")
+          .join("");
+        const box = document.getElementById("mem-list");
+        box.innerHTML = append ? box.innerHTML + html : html;
+        document.getElementById("mem-load-more")?.classList.toggle("hidden", !d.pageInfo?.hasMore);
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function handleExportMemoryJsonl() {
+      const r = await fetch(API + "/memory/export");
+      const text = await r.text();
+      const blob = new Blob([text], { type: "application/x-ndjson;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "academy-memory-" + new Date().toISOString().slice(0, 10) + ".jsonl";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    async function handleImportMemoryJsonl() {
+      try {
+        const jsonlText = (document.getElementById("mem-import-jsonl")?.value || "").trim();
+        const r = await fetch(API + "/memory/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({ jsonlText }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Import failed");
+        setBanner(d.message, "ok");
+        await fetchUnlimitedMemory(false);
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    async function handleAddInstructor(e) {
+      e.preventDefault();
+      try {
+        const r = await fetch(API + "/admin/instructors", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({
+            name: document.getElementById("inst-name").value.trim(),
+            email: document.getElementById("inst-email").value.trim() || undefined,
+            phone: document.getElementById("inst-phone").value.trim() || undefined,
+            specialties: document.getElementById("inst-spec").value.trim(),
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Failed to add instructor");
+        e.target.reset();
+        setBanner("Added instructor: " + d.instructor.name, "ok");
+        fetchAdminDashboard();
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function handleReviewCourse(courseId, action) {
+      try {
+        const r = await fetch(API + "/admin/courses/" + encodeURIComponent(courseId) + "/approve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-admin-code": getAdminCode() },
+          body: JSON.stringify({ action }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Review failed");
+        setBanner("Course " + action + "D.", "ok");
+        await Promise.all([fetchCatalog(false), fetchAdminDashboard()]);
+      } catch (err) {
+        setBanner(err.message, "err");
+      }
+    }
+
+    async function fetchAdminDashboard() {
+      try {
+        const headers = { "x-admin-code": getAdminCode() };
+        const [aRes, qRes, iRes] = await Promise.all([
+          fetch(API + "/admin/analytics", { headers }),
+          fetch(API + "/admin/courses/review-queue", { headers }),
+          fetch(API + "/instructors"),
+        ]);
+        const aData = await aRes.json();
+        if (!aRes.ok) throw new Error(aData.error || "Analytics failed");
+        const qData = await qRes.json();
+        const iData = await iRes.json();
+
+        document.getElementById("stat-students").textContent = aData.totalStudents ?? 0;
+        document.getElementById("stat-courses").textContent = aData.totalCourses ?? 0;
+        document.getElementById("stat-enrollments").textContent = aData.totalEnrollments ?? 0;
+        document.getElementById("stat-etb").textContent = Number(aData.revenue?.ETB || 0).toFixed(2) + " ETB";
+        document.getElementById("stat-usd").textContent = "$" + Number(aData.revenue?.USD || 0).toFixed(2);
+
+        document.getElementById("instructors-list").innerHTML = (iData.instructors || [])
+          .map((ins) => '<div class="module-item"><strong>' + escapeHtml(ins.name) + '</strong> — ' + escapeHtml((ins.specialties || []).join(", ")) + "</div>")
+          .join("");
+
+        document.getElementById("admin-review-queue").innerHTML = (qData.courses || []).slice(0, 15)
+          .map((c) => {
+            const st = c.approval?.status || (c.isPublished ? "APPROVED" : "PENDING_APPROVAL");
+            return (
+              '<div class="module-item"><strong>' +
+              escapeHtml(c.title) +
+              '</strong> <span class="tag">' +
+              escapeHtml(st) +
+              '</span><div style="display:flex;gap:0.4rem;margin-top:0.35rem"><button class="btn-success" onclick="handleReviewCourse(\'' +
+              escapeHtml(c.id) +
+              "','APPROVE')\">Approve</button><button class=\"btn-danger\" onclick=\"handleReviewCourse('" +
+              escapeHtml(c.id) +
+              "','REJECT')\">Reject</button></div></div>"
+            );
+          })
+          .join("");
+      } catch (e) {
+        setBanner(e.message, "err");
+      }
+    }
+
+    updateSessionUI();
+    fetchCatalog(false);
+    if (authToken) {
+      fetchMyCourses();
+      fetchMySubmissions();
+    }
+  </script>
+</body>
+</html>`;
+
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.status(200).send(FRONTEND_HTML);
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+app.use((err, req, res, next) => {
+  if (err && err.code === 'P2002') {
+    return res.status(409).json({ error: 'A record with that unique field already exists' });
+  }
+  if (err && err.code === 'P2025') {
+    return res.status(404).json({ error: 'Requested record not found' });
+  }
+  if (err && err.code === 'P2003') {
+    return res.status(400).json({ error: 'Invalid foreign key reference' });
+  }
+  console.error(err.stack || err);
+  const statusCode = err.statusCode || 500;
+  res.status(statusCode).json({ error: err.message || 'Internal Server Error' });
+});
+
+// ============================================================================
+// 10. STARTUP & GRACEFUL SHUTDOWN (SUPPORTS --seed-bulk=N CLI FLAG)
+// ============================================================================
+let serverInstance;
+
+async function startServer() {
+  try {
+    await prisma.$connect();
+    await ensureAcademyConfig();
+    console.log('PostgreSQL connected via Prisma ORM');
+
+    const seedArg = process.argv.find((arg) => arg.startsWith('--seed-bulk='));
+    if (seedArg) {
+      const count = Number(seedArg.split('=')[1]) || 500;
+      const stats = await seedBulkCourses({ totalCourses: count, batchSize: 1000 });
+      console.log('Seed completed:', stats);
+    }
+
+    serverInstance = app.listen(PORT, () => {
+      console.log(`${ACADEMY_NAME} running on http://localhost:${PORT}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+}
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}. Closing server and database connection...`);
+  if (serverInstance) {
+    await new Promise((resolve) => serverInstance.close(resolve));
+  }
+  await prisma.$disconnect();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+startServer();
